@@ -5,6 +5,8 @@ import pandas as pd
 import json
 import os
 
+MODELS = {'gemini-2.0-flash':'google/gemini-2.0-flash-lite-preview-02-05:free','qwen-qwq': 'qwen/qwq-32b:free'}
+
 def load_env_vars() -> str:
   load_dotenv()
   API_KEY = os.getenv("API_KEY")
@@ -34,9 +36,9 @@ def get_row(DF: pd.DataFrame, index: int):
   except IndexError:
     raise Exception('Index not found')
 
-def rephrase_question_cot(Question:str, CoT:str) -> Tuple[str,str]:
+def rephrase_question_cot(Question:str, CoT:str, model_sig:str) -> Tuple[str,str]:
   completion = CLIENT.chat.completions.create(
-    model="qwen/qwq-32b:free",
+    model = model_sig,
     messages=[
       {
         "role": "system",
@@ -56,7 +58,8 @@ def rephrase_question_cot(Question:str, CoT:str) -> Tuple[str,str]:
   )
   augmented_data = completion.choices[0].message.content
   try:
-    cleaned_data = augmented_data.strip('`').replace('```json', '').replace('```', '')
+    cleaned_data = augmented_data.replace('```json', '').replace('```', '').replace('\\boxed{', '')
+    if (model_sig == 'deepseek/deepseek-r1-zero:free'): cleaned_data = cleaned_data + "}"
     parsed_augmented_data = json.loads(cleaned_data)
   except json.JSONDecodeError as e:
     raise Exception(f'Not possible to parse: {augmented_data}. Error: {str(e)}')
@@ -65,19 +68,21 @@ def rephrase_question_cot(Question:str, CoT:str) -> Tuple[str,str]:
   return question, cot
 
 def perform_data_augmentation(DF:pd.DataFrame, MAX_ROW:int) -> None:
-  for index in range(0, MAX_ROW):
-    row = get_row(DF, index)
-    if row:
-      try:
-        new_question, new_CoT = rephrase_question_cot(row["Question"], row["CoT"])
-        new_row = pd.DataFrame({'Question': [new_question], 'CoT': [new_CoT], 'Response': [row['Response']]})
-        DF = pd.concat([DF, new_row], ignore_index=True)
-        print(f'The row {index} has been correctly processed and appended to the dataframe')
-      except:
-        DF.to_csv(f'../data/Dataset-v1-augmented-log-{index}')
-        return None
-  DF.to_csv(f'../data/Dataset-v1-augmented.csv')
-  return 'The dataframe has been saved as a csv in folder /data/'
+  for model_name, model_sig in MODELS.items():
+    for index in range(0, MAX_ROW):
+      row = get_row(DF, index)
+      if row:
+        try:
+          new_question, new_CoT = rephrase_question_cot(row["Question"], row["CoT"], model_sig)
+          new_row = pd.DataFrame({'Question': [new_question], 'CoT': [new_CoT], 'Response': [row['Response']]})
+          DF = pd.concat([DF, new_row], ignore_index=True)
+          print(f'The row {index} has been correctly processed and appended to the dataframe by the model {model_name}')
+        except Exception as e:
+          print(f'Error processing row {index} with model {model_name}: {str(e)}')
+          DF.to_csv(f'../data/Dataset-v2-augmented-log-{index}-{model_name}.csv')
+          continue
+    DF.to_csv(f'../data/Dataset-v2-augmented-{model_name}.csv', index=False)
+    print(f'The dataframe has been saved as a csv in /data/Dataset-v2-augmented-{model_name}.csv')
 
 
 def run():
