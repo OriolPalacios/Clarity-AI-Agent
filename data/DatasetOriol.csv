@@ -191,35 +191,341 @@ So, with clear inline documentation to explain each step—like why certain oper
 (begin
   (mint u200 'ST398K1WZTBVY6FE2YEHM6HP20VSNVSSPJTW0D53M)
   (mint u100 'ST1JDEC841ZDWN9CKXKJMDQGP5TW1AM10B7EV0DV9))"
-"Create a Clarity smart contract for the PoX (Proof of Transfer X) protocol on Stacks that enables users to lock STX tokens for reward cycles, delegate stacking authority to others, and vote to reject PoX. Include functions to lock tokens for specified periods, track locked amounts via maps, validate PoX address formats (Bitcoin versions), enforce stacking thresholds (25% and 100% of liquid supply), manage delegation permissions with expiration heights, and handle reward cycle calculations. Use storage maps for stacking state, reward cycles, and delegation records, and include constants for reward cycle lengths (prepare: 100 blocks, reward: 2100 blocks), minimum/maximum lock periods (1-12 cycles), and address version validations. Ensure functions like stack-stx, delegate-stx, reject-pox, and getters for balance/lock details, while adhering to PoX’s unlock mechanics and node-synchronized reward set tracking","Okay, the user wants a Clarity contract for PoX on Stacks. Let me start by recalling the requirements. They need functions to lock STX, delegate stacking, and vote to reject PoX. The contract should have storage maps for tracking stacking state, reward cycles, and delegation. Constants like reward cycle lengths (100 prepare, 2100 reward blocks) and lock periods (1-12 cycles) are necessary. Also, address validation for Bitcoin formats and stacking thresholds (25% and 100% of liquid supply).
-
-First, I'll define the constants. MIN and MAX reward cycles, prepare and reward cycle lengths. Then Bitcoin address versions like P2PKH and P2SH. Next, the stacking thresholds as fractions of the liquid supply.
-
-For storage, I need maps like stacking-state to track each user's locked STX, reward cycles, and delegation. The stacking-state map will have the principal as the key and details like PoX address, first reward cycle, lock period, etc. Reward-cycle-pox-address-list might track addresses and their stakes per cycle. Delegation-state could store delegation permissions and expiration heights.
-
-Public functions: stack-stx to lock STX, delegate-stx to allow others to act on behalf, reject-pox to vote against PoX. Getters like get-stacker-info and get-total-ustx-stacked for querying.
-
-Need to handle PoX address validation. Functions like check-pox-addr-version and check-pox-addr-hashbytes to ensure valid Bitcoin addresses. Also, check-pox-lock-period to enforce 1-12 cycles.
-
-Error handling is crucial. Define constants for error codes like insufficient funds or invalid lock periods. Use asserts! and try! to validate inputs and state transitions.
-
-The unlock mechanics require calculating unlock heights based on reward cycles. Functions like reward-cycle-to-burn-height and burn-height-to-reward-cycle will convert between burnchain heights and reward cycles.
-
-Delegation functions must check permissions and expiration. revoke-delegate-stx to remove delegation.
-
-For stacking thresholds, get-stacking-minimum calculates 25% of liquid supply. The can-stack-stx function ensures the amount meets the threshold.
-
-Testing the functions to ensure they update maps correctly and handle edge cases like insufficient funds or invalid addresses.
-
-Wait, the user mentioned partial stacking and aggregation. Functions like stack-aggregation-commit and stack-aggregation-increase might be needed for partial commitments. Also, delegate-stack-extend and delegate-stack-increase for extending or increasing locks via delegation.
-
-Need to include the replacement for stx-account since it's broken in the test environment. stx-account-from-pox-data to fetch balances using PoX data.
-
-Finally, ensure all functions adhere to PoX's unlock rules and that the node can track reward sets correctly. The contract should maintain invariants between stacking-state and reward-cycle entries as mentioned in the provided code examples.",too large code
 "Create a Clarity smart contract for a Stacks blockchain multisig wallet that allows owner management (adding/removing with threshold checks), transaction submission/confirmation/revocation, and cross-chain token swaps via a magic bridge interface. Implement SIP-009/NFT and SIP-010/FT trait integrations for asset transfers, enforce access control through allowed callers, validate transaction confirmations against owner thresholds, and include error handling for ownership conflicts, invalid parameters, and unauthorized actions. Structure the code with clear comments, data maps for transactions/owners, and helper functions for internal state updates, ensuring all critical operations are guarded by sender authentication and parameter validity checks","The code implements a multi-signature wallet (Multisafe) in Clarity for the Stacks blockchain. Wait, I need to understand the core functionality first - this is a secure wallet requiring multiple confirmations before executing transactions. Okay, the contract starts by importing several traits (interfaces) that define the behavior of executors, safes, NFTs, fungible tokens, and a ""magic bridge"" for cross-chain functionality. The contract then implements the safe-trait interface, establishing itself as a safe.
 The error constants are comprehensively defined to cover various failure scenarios, from authorization issues to transaction state problems. Maybe the most important design decision is using the contract itself as a constant (SELF) to reference its own principal, which enables the contract to perform actions as itself. The contract maintains crucial state variables: a list of wallet owners (limited to 20), a confirmation threshold, and a transaction nonce. Check these variables - they're fundamental to the multi-signature functionality.
 The contract offers complete owner management with functions to add and remove owners, with careful validation to maintain security. The user wants the threshold to always be valid - it must be greater than zero and less than or equal to the number of owners. The transaction management implements a robust workflow: submit → confirm → execute. Wait, there's an interesting design here - transactions are stored in a map with detailed parameters and confirmation status, and owners can submit, confirm, and revoke their confirmations.
-Might be worth noting the security design - most functions verify the caller is either the contract itself or an authorized owner. The contract also has special integration with a ""magic bridge"" for cross-chain functionality, allowing owners to initialize swappers and execute escrow swaps. Maybe the most elegant aspect is the initialization function that sets up the initial owners and threshold - in this case, three specific principals with a threshold of 2 (meaning any 2 of the 3 owners must confirm a transaction). Overall, the contract creates a secure, flexible multi-signature wallet with cross-chain capabilities.",https://github.com/Trust-Machines/multisafe/blob/main/contracts/safe.clar
+Might be worth noting the security design - most functions verify the caller is either the contract itself or an authorized owner. The contract also has special integration with a ""magic bridge"" for cross-chain functionality, allowing owners to initialize swappers and execute escrow swaps. Maybe the most elegant aspect is the initialization function that sets up the initial owners and threshold - in this case, three specific principals with a threshold of 2 (meaning any 2 of the 3 owners must confirm a transaction). Overall, the contract creates a secure, flexible multi-signature wallet with cross-chain capabilities.",";;title: safe-clar
+
+(use-trait executor-trait .traits.executor-trait) 
+(use-trait safe-trait .traits.safe-trait)
+(use-trait nft-trait .traits.sip-009-trait)
+(use-trait ft-trait .traits.sip-010-trait)
+(use-trait magic-bridge-trait .traits.magic-bridge-trait)
+
+(impl-trait .traits.safe-trait)
+
+(define-constant ERR-CALLER-MUST-BE-SELF (err u100))
+(define-constant ERR-OWNER-ALREADY-EXISTS (err u110))
+(define-constant ERR-OWNER-NOT-EXISTS (err u120))
+(define-constant ERR-UNAUTHORIZED-SENDER (err u130))
+(define-constant ERR-ONLY-END-USER (err u135))
+(define-constant ERR-TX-NOT-FOUND (err u140))
+(define-constant ERR-TX-ALREADY-CONFIRMED-BY-OWNER (err u150))
+(define-constant ERR-TX-INVALID-EXECUTOR (err u160))
+(define-constant ERR-INVALID-SAFE (err u170))
+(define-constant ERR-TX-CONFIRMED (err u180))
+(define-constant ERR-TX-NOT-CONFIRMED-BY-SENDER (err u190))
+(define-constant ERR-THRESHOLD-CANT-BE-ZERO (err u210))
+(define-constant ERR-OWNER-OVERFLOW (err u220))
+(define-constant ERR-THRESHOLD-OVERFLOW (err u230))
+(define-constant ERR-TX-INVALID-FT (err u240))
+(define-constant ERR-TX-INVALID-NFT (err u250))
+(define-constant ERR-MB-ADDRESS-NOT-SET (err u260))
+(define-constant ERR-INVALID-MB-ADDRESS (err u270))
+
+(define-constant SELF (as-contract tx-sender))
+
+
+(define-constant VERSION ""0.0.5.beta"")
+
+(define-read-only (get-version) 
+    VERSION
+)
+
+
+(define-data-var owners (list 20 principal) (list)) 
+
+(define-read-only (get-owners)
+    (var-get owners)
+)
+
+(define-private (add-owner-internal (owner principal))
+    (let 
+        (
+           (new-owners (unwrap! (as-max-len? (append (var-get owners) owner) u20) ERR-OWNER-OVERFLOW))
+        )
+        (ok (var-set owners new-owners))
+    )
+)
+
+(define-public (add-owner (owner principal))
+    (begin
+        (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+        (asserts! (is-none (index-of (var-get owners) owner)) ERR-OWNER-ALREADY-EXISTS)
+        (add-owner-internal owner)
+    )
+)
+
+(define-data-var rem-owner principal tx-sender)
+
+(define-private (remove-owner-filter (owner principal)) (not (is-eq owner (var-get rem-owner))))
+
+(define-public (remove-owner (owner principal))
+    (let
+        (
+            (owners-list (var-get owners))
+        )
+        (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+        (asserts! (is-some (index-of owners-list owner)) ERR-OWNER-NOT-EXISTS)
+        (asserts! (>= (- (len owners-list) u1) (var-get threshold)) ERR-THRESHOLD-OVERFLOW)
+        (var-set rem-owner owner)
+        (ok (var-set owners (unwrap-panic (as-max-len? (filter remove-owner-filter owners-list) u20))))
+    )
+)
+
+
+
+(define-data-var threshold uint u1)
+
+(define-read-only (get-threshold)
+    (var-get threshold)
+)
+
+(define-private (set-threshold-internal (value uint))
+    (var-set threshold value)
+)
+
+(define-public (set-threshold (value uint))
+    (begin
+        (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+        (asserts! (> value u0) ERR-THRESHOLD-CANT-BE-ZERO)
+        (asserts! (<= value (len (var-get owners))) ERR-THRESHOLD-OVERFLOW)
+        (ok (set-threshold-internal value))
+    )
+)
+
+
+(define-data-var nonce uint u0)
+
+(define-read-only (get-nonce)
+ (var-get nonce)
+)
+
+(define-private (increase-nonce)
+    (var-set nonce (+ (var-get nonce) u1))
+)
+
+
+
+(define-map allowed-callers principal bool)
+
+(define-public (allow-caller (caller principal))
+  (begin
+    (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+    (ok (map-set allowed-callers caller true))
+  )
+)
+
+(define-public (revoke-caller (caller principal))
+  (begin
+    (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+    (ok (map-delete allowed-callers caller))
+  )
+)
+
+(define-read-only (is-allowed-caller (caller principal))
+  (or
+    (match (map-get? allowed-callers caller)
+      value true
+      false
+    )
+    (is-eq tx-sender caller)
+  )
+)
+
+
+(define-read-only (get-info)
+    (ok {
+        version: (get-version),
+        owners: (get-owners),
+        threshold: (get-threshold),
+        nonce: (get-nonce),
+        mb-address: (get-mb-address)
+    })
+)
+
+
+
+
+(define-map transactions 
+    uint 
+    {
+        executor: principal,
+        threshold: uint,
+        confirmations: (list 20 principal),
+        confirmed: bool,
+        param-ft: principal,
+        param-nft: principal,
+        param-p: (optional principal),
+        param-u: (optional uint),
+        param-b: (optional (buff 20))
+    }
+)
+
+(define-private (add (executor <executor-trait>) (param-ft <ft-trait>) (param-nft <nft-trait>) (param-p (optional principal)) (param-u (optional uint)) (param-b (optional (buff 20))))
+    (let 
+        (
+            (tx-id (get-nonce))
+        ) 
+        (map-insert transactions tx-id {
+            executor: (contract-of executor),
+            threshold: (var-get threshold), 
+            confirmations: (list), 
+            confirmed: false,
+            param-ft: (contract-of param-ft),
+            param-nft: (contract-of param-nft),
+            param-p: param-p,
+            param-u: param-u,
+            param-b: param-b
+        })
+        (increase-nonce)
+        tx-id
+    )
+)
+
+(define-read-only (get-transaction (tx-id uint))
+    (merge {id: tx-id} (unwrap-panic (map-get? transactions tx-id)))
+)
+
+(define-read-only (get-transactions (tx-ids (list 20 uint)))
+    (map get-transaction tx-ids)
+)
+
+(define-data-var rem-confirmation principal tx-sender)
+
+(define-private (remove-confirmation-filter (owner principal)) (not (is-eq owner (var-get rem-confirmation))))
+
+
+(define-public (revoke (tx-id uint))
+    (let 
+        (
+            (tx (unwrap! (map-get? transactions tx-id) ERR-TX-NOT-FOUND))
+            (confirmations (get confirmations tx))
+        )
+        (asserts! (is-allowed-caller contract-caller) ERR-ONLY-END-USER)
+        (asserts! (is-eq (get confirmed tx) false) ERR-TX-CONFIRMED)
+        (asserts! (is-some (index-of confirmations tx-sender)) ERR-TX-NOT-CONFIRMED-BY-SENDER)
+        (var-set rem-confirmation tx-sender)
+        (let 
+            (
+                (new-confirmations  (unwrap-panic (as-max-len? (filter remove-confirmation-filter confirmations) u20)))
+                (new-tx (merge tx {confirmations: new-confirmations}))
+            )
+            (map-set transactions tx-id new-tx)
+            (print {action: ""multisafe-revoke"", sender: tx-sender, tx-id: tx-id})
+            (ok true)
+        )
+    )
+)
+
+
+(define-public (confirm (tx-id uint) (executor <executor-trait>) (safe <safe-trait>) (param-ft <ft-trait>) (param-nft <nft-trait>))
+    (begin
+        (asserts! (is-allowed-caller contract-caller) ERR-ONLY-END-USER)
+        (asserts! (is-some (index-of (var-get owners) tx-sender)) ERR-UNAUTHORIZED-SENDER)
+        (asserts! (is-eq (contract-of safe) SELF) ERR-INVALID-SAFE) 
+        (let
+            (
+                (tx (unwrap! (map-get? transactions tx-id) ERR-TX-NOT-FOUND))
+                (confirmations (get confirmations tx))
+            )
+
+            (asserts! (is-eq (get confirmed tx) false) ERR-TX-CONFIRMED)
+            (asserts! (is-none (index-of confirmations tx-sender)) ERR-TX-ALREADY-CONFIRMED-BY-OWNER)
+            (asserts! (is-eq (get executor tx) (contract-of executor)) ERR-TX-INVALID-EXECUTOR)
+            (asserts! (is-eq (get param-ft tx) (contract-of param-ft)) ERR-TX-INVALID-FT)
+            (asserts! (is-eq (get param-nft tx) (contract-of param-nft)) ERR-TX-INVALID-NFT)
+            
+            (let 
+                (
+                    (new-confirmations (unwrap-panic (as-max-len? (append confirmations tx-sender) u20)))
+                    (confirmed (>= (len new-confirmations) (get threshold tx)))
+                    (new-tx (merge tx {confirmations: new-confirmations, confirmed: confirmed}))
+                )
+                (map-set transactions tx-id new-tx)
+                (and confirmed (try! (as-contract (contract-call? executor execute safe param-ft param-nft (get param-p tx) (get param-u tx) (get param-b tx)))))
+                (print {action: ""multisafe-confirmation"", sender: tx-sender, tx-id: tx-id, confirmed: confirmed})
+                (ok confirmed)
+            )
+        )
+    )
+)
+
+(define-public (submit (executor <executor-trait>) (safe <safe-trait>) (param-ft <ft-trait>) (param-nft <nft-trait>) (param-p (optional principal)) (param-u (optional uint)) (param-b (optional (buff 20))))
+    (begin
+        (asserts! (is-allowed-caller contract-caller) ERR-ONLY-END-USER)
+        (asserts! (is-some (index-of (var-get owners) tx-sender)) ERR-UNAUTHORIZED-SENDER)
+        (asserts! (is-eq (contract-of safe) SELF) ERR-INVALID-SAFE) 
+        (let
+            ((tx-id (add executor param-ft param-nft param-p param-u param-b)))
+            (print {action: ""multisafe-submit"", sender: tx-sender, tx-id: tx-id, executor: executor, param-ft: param-ft, param-nft: param-nft, param-p: param-p, param-u: param-u, param-b: param-b})
+            (unwrap-panic (confirm tx-id executor safe param-ft param-nft))
+            (ok tx-id)
+        )
+    )
+)
+
+
+(define-data-var mb-address principal SELF)
+
+(define-public (set-mb-address (address principal))
+    (begin
+        (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+        (ok (var-set mb-address address))
+    )
+)
+
+(define-read-only (get-mb-address)
+ (var-get mb-address)
+)
+
+(define-public (mb-initialize-swapper (bridge <magic-bridge-trait>))
+    (begin
+        (asserts! (not (is-eq (var-get mb-address) SELF)) ERR-MB-ADDRESS-NOT-SET)
+        (asserts! (is-eq (contract-of bridge) (var-get mb-address)) ERR-INVALID-MB-ADDRESS)
+        (asserts! (is-some (index-of (var-get owners) tx-sender)) ERR-UNAUTHORIZED-SENDER)
+        (try! (as-contract (contract-call? bridge initialize-swapper)))
+        (ok true)
+    )
+)
+
+(define-public (mb-escrow-swap 
+    (bridge <magic-bridge-trait>)
+    (block { header: (buff 80), height: uint })
+    (prev-blocks (list 10 (buff 80)))
+    (tx (buff 1024))
+    (proof { tx-index: uint, hashes: (list 12 (buff 32)), tree-depth: uint })
+    (output-index uint)
+    (sender (buff 33))
+    (recipient (buff 33))
+    (expiration-buff (buff 4))
+    (hash (buff 32))
+    (swapper-buff (buff 4))
+    (supplier-id uint)
+    (min-to-receive uint)
+  )
+    (begin
+        (asserts! (not (is-eq (var-get mb-address) SELF)) ERR-MB-ADDRESS-NOT-SET)
+        (asserts! (is-eq (contract-of bridge) (var-get mb-address)) ERR-INVALID-MB-ADDRESS)
+        (asserts! (is-some (index-of (var-get owners) tx-sender)) ERR-UNAUTHORIZED-SENDER)
+        (try! (as-contract (contract-call? bridge escrow-swap block prev-blocks tx proof output-index sender recipient expiration-buff hash swapper-buff supplier-id min-to-receive)))
+        (ok true)
+    )
+)
+
+(define-private (init (o (list 20 principal)) (m uint))
+    (begin
+        (map add-owner-internal o)
+        (set-threshold-internal m)
+        (print {action: ""multisafe-init""})
+    )
+)
+
+(init (list 
+    'ST1SJ3DTE5DN7X54YDH5D64R3BCB6A2AG2ZQ8YPD5 
+    'ST2CY5V39NHDPWSXMW9QDT3HC3GD6Q6XX4CFRK9AG 
+    'ST2JHG361ZXG51QTKY2NQCVBPPRRE2KZB1HR05NNC
+) u2) "
 "Develop a Clarity smart contract for a Stacks blockchain price oracle that retrieves real-time and historical BTC/USD prices from the Pyth Network’s pyth-storage-v3 contract, using a price feed ID while handling errors with granular codes. It should support historical price queries via at-block and Stacks block header hashes, integrate with the sbtc-token contract to fetch total supply, normalize values (dividing by 10^8 for precision), and compute the total sBTC value in USD. The contract must ensure robust error handling for failed external calls, invalid data, and arithmetic overflow while maintaining a structured design with read-only functions, type-safe validation, and clear dependencies on external traits/contracts.","Okay, this contract is designed to retrieve and process BTC/USD price data from the Pyth Network while ensuring error resilience and modularity. Wait, so the first thing to notice is the error-handling strategy. By defining `ERR_UNEXPECTED` as `u5000`, the contract ensures that unexpected failures are managed predictably, preventing issues from propagating unpredictably.  
 
 Then, for fetching the real-time BTC price, the `get-btc-price` function interacts with `pyth-storage-v3` using `contract-call?`, passing the predefined price feed ID. Maybe the most important part here is how it handles responses: if the call succeeds, the function extracts and returns the price wrapped in `some`; otherwise, it returns `none`, making sure failure cases don’t cause execution failures.  
