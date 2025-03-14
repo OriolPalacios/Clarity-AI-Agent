@@ -41,6 +41,19 @@ The following tools and libraries are used in this project:
     pip install -r requirements.txt
     ```
 
+## Pretrained Model
+
+The fine-tuned model is available on Hugging Face:
+[![Hugging Face](https://img.shields.io/badge/🤗_Hugging_Face-DeepSeek--R1--Clarity--AI--Agent-blue)](https://huggingface.co/OriolPalacios/DeepSeek-R1-Clarity-AI-Agent/tree/main)
+
+You can access and download all model files from the repository above to use the fine-tuned DeepSeek-R1 model for Clarity smart contract development.
+
+## Training Metrics
+
+Training metrics and experiment tracking are available on Weights & Biases:
+[![Weights & Biases](https://img.shields.io/badge/📊_Weights_&_Biases-Training_Report-yellow)](https://wandb.ai/oriol_palacios-universidad-nacional-de-san-antonio-abad-/Fine-tune-DeepSeek-R1-Distill-Llama-8B%20on%20Clarity%20Dataset%20for%20Clarity-AI-Agent?nw=nwuseroriol_palacios)
+
+This report contains detailed information about the fine-tuning process, including loss curves, evaluation metrics, and hyperparameter configurations used during model training.
 
 ## Contributors
 
