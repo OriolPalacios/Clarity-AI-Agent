@@ -1,4 +1,8 @@
-# Clarity-AI-Agent-Mockup-repo
+# Clarity-AI-Agent
+
+## Overview
+
+Clarity-AI-Agent is a project aimed at enhancing the development of decentralized applications (dApps) by fine-tuning AI models to assist developers in writing smart contracts using the Clarity language. The project focuses on data augmentation techniques to enrich a dataset containing questions, chain-of-thought (CoT) processes, and code responses, which are then utilized to fine-tune the deepseek r1 model using Low-Rank Adaptation (LoRA).
 
 ## Purpose
 
