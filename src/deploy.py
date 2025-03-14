@@ -7,7 +7,7 @@ import time
 # Configuration - MODIFY THESE VALUES
 AWS_REGION = 'us-east-1'  # Your AWS region
 ROLE_ARN = 'arn:aws:iam::XXXXXXXXXXXX:role/SageMakerHuggingFaceExecutionRole'  # Your role ARN
-MODEL_ID = 'mistralai/Mistral-7B-Instruct-v0.2'  # HF model to deploy
+MODEL_ID = 'OriolPalacios/DeepSeek-R1-Clarity-AI-Agent'  # HF model to deploy
 ENDPOINT_NAME = 'hf-llm-endpoint'  # Unique endpoint name
 INSTANCE_TYPE = 'ml.g5.xlarge'  # Instance type
 HF_TOKEN = None  # Your HF token if using gated models
