@@ -1,0 +1,4242 @@
+Question,CoT,Response
+"Develop a sophisticated Clarity smart contract for Stacks blockchain to operate a decentralized borrowing system enabling users to deposit STX tokens, secure loans using their holdings, and collect rewards. The contract should incorporate user-specific deposit tracking, a loan mechanism with interest rates tied to block progression, and reward distribution systems. Ensure a 50% loan-to-value restriction, 10% annual interest, and robust safeguards against over-borrowing, repayment failures, and other errors. Include public interfaces to retrieve user deposit balances and outstanding loan details, and enforce secure asset transfers using standard contract protocols. Add thorough documentation in comments outlining the function and purpose of every data structure and method within the contract.","Starting with the core requirements, the contract must handle STX-based lending with dynamic interest calculations and yield distribution. Data structures are designed using maps to track per-user deposits and loans, with block timestamps for interest tracking. Global variables track total deposits, interest reserves, and fixed rates. Borrow limits enforce 50% collateral ratios against deposited tokens. Key functions handle deposit intake using secure STX transfers, loan issuance with interest calculations, and repayments that update state and interest pools. The yield distribution function calculates proportional payouts based on deposit participation. Critical oversight reveals an incomplete loan ledger update in the borrowing mechanism which would inaccurately track accrued interest. Comprehensive query functions allow state inspection without modification. All logic adheres to the specified constraints: LTV thresholds, 10% APR compute formulas, and error conditions for repayment insufficiency and overextension.",";; Define the contract's data variables
+
+;; Maps a user's principal address to their deposited amount.
+(define-map deposits { owner: principal } { amount: uint })
+
+;; Maps a borrower's principal address to their loan details: amount and the last interaction block.
+(define-map loans principal { amount: uint, last-interaction-block: uint })
+
+;; Holds the total amount of deposits in the contract, initialized to 0.
+(define-data-var total-deposits uint u0)
+
+;; Represents the reserve funds in the pool, initialized to 0.
+(define-data-var pool-reserve uint u0)
+
+;; The interest rate for loans, represented as 10% (out of a base of 100).
+(define-data-var loan-interest-rate uint u10) ;; Representing 10% interest rate
+
+;; Error constants for various failure scenarios.
+(define-constant err-no-interest (err u100))
+(define-constant err-overpay (err u200))
+(define-constant err-overborrow (err u300))
+
+;; Public function for users to deposit STX into the contract.
+;; Updates their balance and the total deposits in the contract.
+(define-public (deposit (amount uint))
+    (let (
+        ;; Fetch the current balance or default to 0 if none exists.
+        (current-balance (default-to u0 (get amount (map-get? deposits { owner: tx-sender }))))
+        )
+        ;; Transfer the STX from sender = ""ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM"" to recipient = ""ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.stx-defi (ie: contract identifier on the chain!)"".
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        ;; Update the user's deposit amount in the map.
+        (map-set deposits { owner: tx-sender } { amount: (+ current-balance amount) })
+        ;; Update the total deposits variable.
+        (var-set total-deposits (+ (var-get total-deposits) amount))
+        ;; Return success.
+        (ok true)
+    )
+)
+
+;; Public function for users to borrow STX based on their deposits.
+(define-public (borrow (amount uint))
+    (let (
+        ;; Fetch user's deposit or default to 0.
+        (user-deposit (default-to u0 (get amount (map-get? deposits { owner: tx-sender }))))
+        ;; Calculate the maximum amount the user is allowed to borrow. (which will be upto HALF of what they deposited)
+        (allowed-borrow (/ user-deposit u2))
+        ;; Fetch current loan details or default to initial values.
+        (current-loan-details (default-to { amount: u0, last-interaction-block: u0 } (map-get? loans tx-sender )))
+        ;; Calculate accrued interest on the current loan.
+        (accrued-interest (calculate-accrued-interest (get amount current-loan-details) (get last-interaction-block current-loan-details)))
+        ;; Calculate the total amount due including interest.
+        (total-due (+ (get amount current-loan-details) (unwrap-panic accrued-interest)))
+        ;; Calculate the new loan total after borrowing additional amount.
+        (new-loan (+ amount))
+    )
+        ;; Ensure the requested borrow amount does not exceed the allowed amount.
+        (asserts! (<= new-loan allowed-borrow) err-overborrow)
+        ;; Transfer the borrowed STX to the user.
+        (let ((recipient tx-sender))
+            (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+        )
+        ;; Update the user's loan details in the map.
+        (map-set loans tx-sender { amount: new-loan, last-interaction-block: burn-block-height })
+        ;; Return success.
+        (ok true)
+    )
+)
+
+;; Read-only function to get the total balance by tx-sender
+(define-read-only (get-balance-by-sender)
+    (ok (map-get? deposits { owner: tx-sender }))
+)
+
+;; Read-only function to get the total balance 
+(define-read-only (get-balance)
+    (ok (var-get total-deposits))
+)
+
+;; Read-only function to get the total amount owed by the user.
+(define-read-only (get-amount-owed)
+    (let (
+        ;; Fetch current loan details or default to initial values.
+        (current-loan-details (default-to { amount: u0, last-interaction-block: u0 } (map-get? loans tx-sender )))
+        ;; Calculate accrued interest on the current loan.
+        (accrued-interest (calculate-accrued-interest (get amount current-loan-details) (get last-interaction-block current-loan-details)))
+        ;; Calculate the total amount due including interest.
+        (total-due (+ (get amount current-loan-details) (unwrap-panic accrued-interest)))
+    )
+    ;; Return the total amount due.
+    (ok total-due)
+    )
+)
+
+;; Public function for users to repay their STX loans.
+(define-public (repay (amount uint))
+    (let (
+        ;; Fetch current loan details or default to initial values.
+        (current-loan-details (default-to { amount: u0, last-interaction-block: u0 } (map-get? loans tx-sender )))
+        ;; Calculate accrued interest since the last interaction.
+        (accrued-interest (unwrap! (calculate-accrued-interest (get amount current-loan-details) (get last-interaction-block current-loan-details)) err-no-interest))
+        ;; Calculate the total amount due including accrued interest.
+        (total-due (+ (get amount current-loan-details) accrued-interest))
+    )
+        ;; Ensure the repayment amount is not more than the total due.
+        (asserts! (>= total-due amount) err-overpay)
+        ;; Transfer the repayment amount from the user to the contract.
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        ;; Update the user's loan details in the map with the new total due.
+        (map-set loans tx-sender { amount: (- total-due amount), last-interaction-block: burn-block-height })
+        ;; Update the pool reserve with the paid interest.
+        (var-set pool-reserve (+ (var-get pool-reserve) accrued-interest))
+        ;; Return success.
+        (ok true)
+    )
+)
+
+;; Public function for users to claim their yield based on the pool reserve and their deposits.
+(define-public (claim-yield)
+    (let (
+        ;; Fetch user's deposit amount or default to 0.
+        (user-deposit (default-to u0 (get amount (map-get? deposits { owner: tx-sender }))))
+        ;; Calculate the yield amount based on user's share of the pool.
+        (yield-amount (/ (* (var-get pool-reserve) user-deposit) (var-get total-deposits)))
+    )
+        ;; Transfer the yield amount from the contract to the user.
+        (let ((recipient tx-sender))
+            (try! (as-contract (stx-transfer? yield-amount tx-sender recipient)))
+        )
+        ;; Update the pool reserve by subtracting the claimed yield.
+        (var-set pool-reserve (- (var-get pool-reserve) yield-amount))
+        ;; Return success.
+        (ok true)
+    )
+)
+
+;; Private function to calculate the accrued interest on a loan.
+(define-private (calculate-accrued-interest (principal uint) (start-block uint))
+    (let (
+        ;; Calculate the number of blocks elapsed since the last interaction.
+        (elapsed-blocks (- burn-block-height start-block))
+        ;; Calculate the interest based on the principal, rate, and elapsed time.
+        (interest (/ (* principal (var-get loan-interest-rate) elapsed-blocks) u10000))
+    )
+        ;; Ensure the loan started in the past (not at block 0).
+        (asserts! (not (is-eq start-block u0)) (ok u0))
+        ;; Return the calculated interest.
+       (ok interest)
+    )
+)"
+"Develop a Clarity smart contract for the Stacks blockchain that establishes a basic NFT marketplace, enabling users to sell NFTs with adjustable parameters such as token ID, expiration time, sale price, payment type (STX or SIP010 tokens), and an optional specific buyer. The contract should support whitelisting of contracts, asset listings, listing cancellations, and purchase fulfillment using both STX and fungible tokens. Ensure robust error handling, security measures, and adherence to standard NFT and fungible token interfaces for interoperability.","## Analysis of NFT Marketplace Smart Contract Design
+
+Initially, the requirements are analyzed: creating a marketplace where users can configure NFT sales with specific parameters. The contract must handle STX and fungible token payments, whitelisting, and secure state management. Technical considerations for Clarity’s constraints, such as type safety and atomic operations, are prioritized.
+
+Storage design uses a map with unique IDs for listings, ensuring efficient access. A nonce increments to generate IDs, preventing duplicates. Security features include a contract whitelist controlled by the owner to restrict interactions with untrusted contracts.
+
+Error handling employs distinct codes for clarity, categorizing issues by context (e.g., invalid listings, expired offers). Listing creation validates parameters, transfers NFT ownership to the contract, and records details. A retrieval function allows public access to listing data.
+
+Cancellations require ownership verification and return assets to the seller. Fulfillment splits into STX and fungible token paths, sharing validation logic for taker eligibility, expiry, and asset matches. Helper functions abstract token transfers, enhancing code reuse and security via the as-contract context.
+
+The payment process securely transfers funds from buyer to seller after NFT ownership is updated. Edge cases like unauthorized cancellations or expired listings are addressed through explicit checks. The design remains minimal, omitting fees but including atomic transactions to prevent partial execution. This structure balances simplicity with robustness, fulfilling all functional and security requirements.",";; A tiny NFT marketplace that allows users to list NFT for sale. They can specify the following:
+;; - The NFT token to sell.
+;; - Listing expiry in block height.
+;; - The payment asset, either STX or a SIP010 fungible token.
+;; - The NFT price in said payment asset.
+;; - An optional intended taker. If set, only that principal will be able to fulfil the listing.
+;;
+;; Source: https://github.com/clarity-lang/book/tree/main/projects/tiny-market
+
+(use-trait nft-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+(use-trait ft-trait  'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
+
+(define-constant contract-owner tx-sender)
+
+;; listing errors
+(define-constant ERR_EXPIRY_IN_PAST (err u1000))
+(define-constant ERR_PRICE_ZERO (err u1001))
+
+;; cancelling and fulfiling errors
+(define-constant ERR_UNKNOWN_LISTING (err u2000))
+(define-constant ERR_UNAUTHORISED (err u2001))
+(define-constant ERR_LISTING_EXPIRED (err u2002))
+(define-constant ERR_NFT_ASSET_MISMATCH (err u2003))
+(define-constant ERR_PAYMENT_ASSET_MISMATCH (err u2004))
+(define-constant ERR_MAKER_TAKER_EQUAL (err u2005))
+(define-constant ERR_UNINTENDED_TAKER (err u2006))
+(define-constant ERR_ASSET_CONTRACT_NOT_WHITELISTED (err u2007))
+(define-constant ERR_PAYMENT_CONTRACT_NOT_WHITELISTED (err u2008))
+
+;; Define a map data structure for the asset listings
+(define-map listings
+  uint
+  {
+    maker: principal,
+    taker: (optional principal),
+    token-id: uint,
+    nft-asset-contract: principal,
+    expiry: uint,
+    price: uint,
+    payment-asset-contract: (optional principal)
+  }
+)
+
+;; Used for unique IDs for each listing
+(define-data-var listing-nonce uint u0)
+
+;; This marketplace requires any contracts used for assets or payments to be whitelisted
+;; by the contract owner of this (marketplace) contract.
+(define-map whitelisted-asset-contracts principal bool)
+
+;; Function that checks if the given contract has been whitelisted.
+(define-read-only (is-whitelisted (asset-contract principal))
+  (default-to false (map-get? whitelisted-asset-contracts asset-contract))
+)
+
+;; Only the contract owner of this (marketplace) contract can whitelist an asset contract.
+(define-public (set-whitelisted (asset-contract principal) (whitelisted bool))
+  (begin
+    (asserts! (is-eq contract-owner tx-sender) ERR_UNAUTHORISED)
+    (ok (map-set whitelisted-asset-contracts asset-contract whitelisted))
+  )
+)
+
+;; Internal function to transfer an NFT asset from a sender to a given recipient.
+(define-private (transfer-nft
+  (token-contract <nft-trait>)
+  (token-id uint)
+  (sender principal)
+  (recipient principal)
+)
+  (contract-call? token-contract transfer token-id sender recipient)
+)
+
+;; Internal function to transfer fungible tokens from a sender to a given recipient.
+(define-private (transfer-ft
+  (token-contract <ft-trait>)
+  (amount uint)
+  (sender principal)
+  (recipient principal)
+)
+  (contract-call? token-contract transfer amount sender recipient none)
+)
+
+;; Public function to list an asset along with its contract
+(define-public (list-asset
+  (nft-asset-contract <nft-trait>)
+  (nft-asset {
+    taker: (optional principal),
+    token-id: uint,
+    expiry: uint,
+    price: uint,
+    payment-asset-contract: (optional principal)
+  })
+)
+  (let ((listing-id (var-get listing-nonce)))
+    ;; Verify that the contract of this asset is whitelisted
+    (asserts! (is-whitelisted (contract-of nft-asset-contract)) ERR_ASSET_CONTRACT_NOT_WHITELISTED)
+    ;; Verify that the asset is not expired
+    (asserts! (> (get expiry nft-asset) burn-block-height) ERR_EXPIRY_IN_PAST)
+    ;; Verify that the asset price is greater than zero
+    (asserts! (> (get price nft-asset) u0) ERR_PRICE_ZERO)
+    ;; Verify that the contract of the payment is whitelisted
+    (asserts! (match (get payment-asset-contract nft-asset)
+      payment-asset
+      (is-whitelisted payment-asset)
+      true
+    ) ERR_PAYMENT_CONTRACT_NOT_WHITELISTED)
+    ;; Transfer the NFT ownership to this contract's principal
+    (try! (transfer-nft
+      nft-asset-contract
+      (get token-id nft-asset)
+      tx-sender
+      (as-contract tx-sender)
+    ))
+    ;; List the NFT in the listings map
+    (map-set listings listing-id (merge
+      { maker: tx-sender, nft-asset-contract: (contract-of nft-asset-contract) }
+      nft-asset
+    ))
+    ;; Increment the nonce to use for the next unique listing ID
+    (var-set listing-nonce (+ listing-id u1))
+    ;; Return the created listing ID
+    (ok listing-id)
+  )
+)
+
+;; Public read-only function to retrieve a listing by its ID
+(define-read-only (get-listing (listing-id uint))
+  (map-get? listings listing-id)
+)
+
+;; Public function to cancel a listing using an asset contract.
+;; This function can only be called by the NFT's creator, and must use the same asset contract that
+;; the NFT uses.
+(define-public (cancel-listing (listing-id uint) (nft-asset-contract <nft-trait>))
+  (let (
+    (listing (unwrap! (map-get? listings listing-id) ERR_UNKNOWN_LISTING))
+    (maker (get maker listing))
+  )
+    ;; Verify that the caller of the function is the creator of the NFT to be cancelled
+    (asserts! (is-eq maker tx-sender) ERR_UNAUTHORISED)
+    ;; Verify that the asset contract to use is the same one that the NFT uses
+    (asserts! (is-eq
+      (get nft-asset-contract listing)
+      (contract-of nft-asset-contract)
+    ) ERR_NFT_ASSET_MISMATCH)
+    ;; Delete the listing
+    (map-delete listings listing-id)
+    ;; Transfer the NFT from this contract's principal back to the creator's principal
+    (as-contract (transfer-nft nft-asset-contract (get token-id listing) tx-sender maker))
+  )
+)
+
+;; Private function to validate that a purchase can be fulfilled
+(define-private (assert-can-fulfil
+  (nft-asset-contract principal)
+  (payment-asset-contract (optional principal))
+  (listing {
+    maker: principal,
+    taker: (optional principal),
+    token-id: uint,
+    nft-asset-contract: principal,
+    expiry: uint,
+    price: uint,
+    payment-asset-contract: (optional principal)
+  })
+)
+  (begin
+    ;; Verify that the buyer is not the same as the NFT creator
+    (asserts! (not (is-eq (get maker listing) tx-sender)) ERR_MAKER_TAKER_EQUAL)
+    ;; Verify the buyer has been set in the listing metadata as its `taker`
+    (asserts!
+      (match (get taker listing) intended-taker (is-eq intended-taker tx-sender) true)
+      ERR_UNINTENDED_TAKER
+    )
+    ;; Verify the listing for purchase is not expired
+    (asserts! (< burn-block-height (get expiry listing)) ERR_LISTING_EXPIRED)
+    ;; Verify the asset contract used to purchase the NFT is the same as the one set on the NFT
+    (asserts! (is-eq (get nft-asset-contract listing) nft-asset-contract) ERR_NFT_ASSET_MISMATCH)
+    ;; Verify the payment contract used to purchase the NFT is the same as the one set on the NFT
+    (asserts!
+      (is-eq (get payment-asset-contract listing) payment-asset-contract)
+      ERR_PAYMENT_ASSET_MISMATCH
+    )
+    (ok true)
+  )
+)
+
+;; Public function to purchase a listing using STX as payment
+(define-public (fulfil-listing-stx (listing-id uint) (nft-asset-contract <nft-trait>))
+  (let (
+    ;; Verify the given listing ID exists
+    (listing (unwrap! (map-get? listings listing-id) ERR_UNKNOWN_LISTING))
+    ;; Set the NFT's taker to the purchaser (caller of the_function)
+    (taker tx-sender)
+  )
+    ;; Validate that the purchase can be fulfilled
+    (try! (assert-can-fulfil (contract-of nft-asset-contract) none listing))
+    ;; Transfer the NFT to the purchaser (caller of the function)
+    (try! (as-contract (transfer-nft nft-asset-contract (get token-id listing) tx-sender taker)))
+    ;; Transfer the STX payment from the purchaser to the creator of the NFT
+    (try! (stx-transfer? (get price listing) taker (get maker listing)))
+    ;; Remove the NFT from the marketplace listings
+    (map-delete listings listing-id)
+    ;; Return the listing ID that was just purchased
+    (ok listing-id)
+  )
+)
+
+;; Public function to purchase a listing using another fungible token as payment
+(define-public (fulfil-listing-ft
+  (listing-id uint)
+  (nft-asset-contract <nft-trait>)
+  (payment-asset-contract <ft-trait>)
+)
+  (let (
+    ;; Verify the given listing ID exists
+    (listing (unwrap! (map-get? listings listing-id) ERR_UNKNOWN_LISTING))
+    ;; Set the NFT's taker to the purchaser (caller of the_function)
+    (taker tx-sender)
+  )
+    ;; Validate that the purchase can be fulfilled
+    (try! (assert-can-fulfil
+      (contract-of nft-asset-contract)
+      (some (contract-of payment-asset-contract))
+      listing
+    ))
+    ;; Transfer the NFT to the purchaser (caller of the function)
+    (try! (as-contract (transfer-nft nft-asset-contract (get token-id listing) tx-sender taker)))
+    ;; Transfer the tokens as payment from the purchaser to the creator of the NFT
+    (try! (transfer-ft payment-asset-contract (get price listing) taker (get maker listing)))
+    ;; Remove the NFT from the marketplace listings
+    (map-delete listings listing-id)
+    ;; Return the listing ID that was just purchased
+    (ok listing-id)
+  )
+)"
+"Design a Clarity smart contract on the Stacks Blockchain adhering to the SIP-009 NFT standard, named 'Your-NFT-Name'. The contract must track the most recently minted token ID, enforce a 1000-token collection cap, and incorporate ownership verification. It requires a base URI for metadata, owner-specific constants, and custom error handling. Implement mandatory SIP-009 functions (like getting the last token ID, ownership info, and transfers) plus a limited owner-authorized minting function that returns newly created token IDs. Ensure all functions include proper security checks to prevent errors.","To create this contract, first enforce the SIP-009 trait for standard compatibility. Define an NFT with a token ID counter starting at zero, and a principal constant for the deployer as the owner. Implement error codes for exceeding limits and unauthorized actions. Use a mutable base URI string for metadata. The mint function must verify the caller's owner status, check the token cap before minting, increment the ID, and return the result. Transfer functions require sender verification via ownership checks. Each SIP-009 function follows required response formats, using assertions and error returns to ensure valid interactions. Data storage (like ownership) utilizes the NFT framework’s built-in functions, with read methods like get-token-uri dynamically generating metadata URLs from stored values.",";; This contract implements the SIP-009 community-standard Non-Fungible Token trait
+(impl-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+
+;; Define the NFT's name
+(define-non-fungible-token Your-NFT-Name uint)
+
+;; Keep track of the last minted token ID
+(define-data-var last-token-id uint u0)
+
+;; Define constants
+(define-constant CONTRACT_OWNER tx-sender)
+(define-constant COLLECTION_LIMIT u1000) ;; Limit to series of 1000
+
+(define-constant ERR_OWNER_ONLY (err u100))
+(define-constant ERR_NOT_TOKEN_OWNER (err u101))
+(define-constant ERR_SOLD_OUT (err u300))
+
+(define-data-var base-uri (string-ascii 80) ""https://your.api.com/path/to/collection/{id}"")
+
+;; SIP-009 function: Get the last minted token ID.
+(define-read-only (get-last-token-id)
+  (ok (var-get last-token-id))
+)
+
+;; SIP-009 function: Get link where token metadata is hosted
+(define-read-only (get-token-uri (token-id uint))
+  (ok (some (var-get base-uri)))
+)
+
+;; SIP-009 function: Get the owner of a given token
+(define-read-only (get-owner (token-id uint))
+  (ok (nft-get-owner? Your-NFT-Name token-id))
+)
+
+;; SIP-009 function: Transfer NFT token to another owner.
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+  (begin
+    ;; #[filter(sender)]
+    (asserts! (is-eq tx-sender sender) ERR_NOT_TOKEN_OWNER)
+    (nft-transfer? Your-NFT-Name token-id sender recipient)
+  )
+)
+
+;; Mint a new NFT.
+(define-public (mint (recipient principal))
+  ;; Create the new token ID by incrementing the last minted ID.
+  (let ((token-id (+ (var-get last-token-id) u1)))
+    ;; Ensure the collection stays within the limit.
+    (asserts! (< (var-get last-token-id) COLLECTION_LIMIT) ERR_SOLD_OUT)
+    ;; Only the contract owner can mint.
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    ;; Mint the NFT and send it to the given recipient.
+    (try! (nft-mint? Your-NFT-Name token-id recipient))
+
+    ;; Update the last minted token ID.
+    (var-set last-token-id token-id)
+    ;; Return a success status and the newly minted NFT ID.
+    (ok token-id)
+  )
+)"
+"Design a Clarity smart contract for the Stacks Blockchain that incorporates the SIP-013 semi-fungible token standard, including the 'sip013-semi-fungible-token-trait' and 'sip013-transfer-many-trait' from 'SPDBEG5X8XD50SPM1JJH0E5CTXGDV5NJTKAKKR5V'. The contract must define a fungible token type, a non-fungible token ID system, and data structures for tracking balances and supplies. Include functions for single and batch transfers (with and without memos), balance inquiries, supply monitoring, and restricted minting to the owner only. Ensure proper error handling, access controls, and event logging while maintaining token ID ownership through a non-fungible tagging system.","Initially, I observe a substantial discrepancy between the user's request and the provided code. The question specifies implementing the SIP-009 NFT standard with a 1000-token collection cap and a named token, but the code instead implements SIP-013 semi-fungible tokens. This reflects a fundamental shift in the token standard's design. The code employs traits for semi-fungible functionality, allowing mixed fungible/non-fungible tracking via composite keys, unlike the pure NFT model requested. Missing features include the collection limit and sequential minting constraints. The implementation uses data maps for balance and supply tracking, appropriate for semi-fungible tokens but not for NFTs. Error handling focuses on ownership and balance checks but omits collection limits. The mint function enables owner-only issuance but lacks token ID counters required for sequential NFTs. The absence of a 'get-last-token-id' function further highlights divergence from SIP-009 requirements, while the code's hybrid ownership tagging aligns with SIP-013. Thus, the code effectively implements SIP-013 but doesn't fulfill the original NFT-based request.","(impl-trait 'SPDBEG5X8XD50SPM1JJH0E5CTXGDV5NJTKAKKR5V.sip013-semi-fungible-token-trait.sip013-semi-fungible-token-trait)
+(impl-trait 'SPDBEG5X8XD50SPM1JJH0E5CTXGDV5NJTKAKKR5V.sip013-transfer-many-trait.sip013-transfer-many-trait)
+
+(define-fungible-token semi-fungible-token)
+(define-non-fungible-token semi-fungible-token-id {token-id: uint, owner: principal})
+(define-map token-balances {token-id: uint, owner: principal} uint)
+(define-map token-supplies uint uint)
+
+(define-constant contract-owner tx-sender)
+
+(define-constant err-owner-only (err u100))
+(define-constant err-insufficient-balance (err u1))
+(define-constant err-invalid-sender (err u4))
+
+(define-private (set-balance (token-id uint) (balance uint) (owner principal))
+	(map-set token-balances {token-id: token-id, owner: owner} balance)
+)
+
+(define-private (get-balance-uint (token-id uint) (who principal))
+	(default-to u0 (map-get? token-balances {token-id: token-id, owner: who}))
+)
+
+(define-read-only (get-balance (token-id uint) (who principal))
+	(ok (get-balance-uint token-id who))
+)
+
+(define-read-only (get-overall-balance (who principal))
+	(ok (ft-get-balance semi-fungible-token who))
+)
+
+(define-read-only (get-total-supply (token-id uint))
+	(ok (default-to u0 (map-get? token-supplies token-id)))
+)
+
+(define-read-only (get-overall-supply)
+	(ok (ft-get-supply semi-fungible-token))
+)
+
+(define-read-only (get-decimals (token-id uint))
+	(ok u0)
+)
+
+(define-read-only (get-token-uri (token-id uint))
+	(ok none)
+)
+
+;; #[allow(unchecked_params)]
+(define-public (transfer (token-id uint) (amount uint) (sender principal) (recipient principal))
+	(let
+		(
+			(sender-balance (get-balance-uint token-id sender))
+		)
+		(asserts! (or (is-eq sender tx-sender) (is-eq sender contract-caller)) err-invalid-sender)
+		(asserts! (<= amount sender-balance) err-insufficient-balance)
+		(try! (ft-transfer? semi-fungible-token amount sender recipient))
+		(try! (tag-nft-token-id {token-id: token-id, owner: sender}))
+		(try! (tag-nft-token-id {token-id: token-id, owner: recipient}))
+		(set-balance token-id (- sender-balance amount) sender)
+		(set-balance token-id (+ (get-balance-uint token-id recipient) amount) recipient)
+		(print {type: ""sft_transfer"", token-id: token-id, amount: amount, sender: sender, recipient: recipient})
+		(ok true)
+	)
+)
+
+(define-public (transfer-memo (token-id uint) (amount uint) (sender principal) (recipient principal) (memo (buff 34)))
+	(begin
+		(try! (transfer token-id amount sender recipient))
+		(print memo)
+		(ok true)
+	)
+)
+
+(define-private (transfer-many-iter (item {token-id: uint, amount: uint, sender: principal, recipient: principal}) (previous-response (response bool uint)))
+	(match previous-response prev-ok (transfer (get token-id item) (get amount item) (get sender item) (get recipient item)) prev-err previous-response)
+)
+
+(define-public (transfer-many (transfers (list 200 {token-id: uint, amount: uint, sender: principal, recipient: principal})))
+	(fold transfer-many-iter transfers (ok true))
+)
+
+(define-private (transfer-many-memo-iter (item {token-id: uint, amount: uint, sender: principal, recipient: principal, memo: (buff 34)}) (previous-response (response bool uint)))
+	(match previous-response prev-ok (transfer-memo (get token-id item) (get amount item) (get sender item) (get recipient item) (get memo item)) prev-err previous-response)
+)
+
+(define-public (transfer-many-memo (transfers (list 200 {token-id: uint, amount: uint, sender: principal, recipient: principal, memo: (buff 34)})))
+	(fold transfer-many-memo-iter transfers (ok true))
+)
+
+(define-public (mint (token-id uint) (amount uint) (recipient principal))
+	(begin
+		(asserts! (is-eq tx-sender contract-owner) err-owner-only)
+		(try! (ft-mint? semi-fungible-token amount recipient))
+		(try! (tag-nft-token-id {token-id: token-id, owner: recipient}))
+		(set-balance token-id (+ (get-balance-uint token-id recipient) amount) recipient)
+		(map-set token-supplies token-id (+ (unwrap-panic (get-total-supply token-id)) amount))
+		(print {type: ""sft_mint"", token-id: token-id, amount: amount, recipient: recipient})
+		(ok true)
+	)
+)
+
+(define-private (tag-nft-token-id (nft-token-id {token-id: uint, owner: principal}))
+	(begin
+		(and
+			(is-some (nft-get-owner? semi-fungible-token-id nft-token-id))
+			(try! (nft-burn? semi-fungible-token-id nft-token-id (get owner nft-token-id)))
+		)
+		(nft-mint? semi-fungible-token-id nft-token-id (get owner nft-token-id))
+	)
+)"
+"Develop a Clarity smart contract for a bridged stablecoin on the Stacks blockchain adhering to the SIP-10 standard with extended bridging capabilities. Include governance features like owner permissions, minting limits, token pausing, and address restrictions. The token must support customizable metadata (name, symbol, URI), precise decimal precision, and secure core operations (transfer, mint, burn) with validation and error management. Add an extension mechanism enabling approved contracts to interact via a restricted API. Ensure all actions trigger audit events and return explicit error codes. The token should initially be paused until unlocked by the owner, and all critical functions must validate caller privileges before proceeding.","Initially, the contract integrates several traits to define its operational interfaces, starting with the SIP-10 standard for token interoperability. Bridging and extension traits are added to enable cross-chain interactions and future upgrades. Error codes are predefined with unique identifiers starting at u10000 to streamline debugging and maintain code clarity. State variables store metadata, balances (using fungible-token), minter allowances, and banned addresses for efficient state tracking. Security measures enforce owner-only access for high-risk functions, with the token starting in a paused state to prevent premature use. Minting uses dual allowance/usage tracking to prevent over-issuance. SIP-10 functions provide standardized access to token data, while internal transfer logic enforces bans and pausing. Administrative functions uniformly check permissions, execute changes, log events, and return status codes. The extension system allows whitelisted contracts to execute controlled operations via run-extension! with authorization checks. Comprehensive input validation and error handling ensure state consistency. Transfer operations include optional memo fields for compliance logging, emitted in events alongside transaction details.",";; title: circle-usdce-token
+;; version:
+;; summary:
+;; description:
+
+(impl-trait 'SP2J933XB2CP2JQ1A4FGN8JA968BBG3NK3EKZ7Q9F.hk-tokens-v1.sip10-token)
+(impl-trait .token-traits.allbrige-bridged-token-trait)
+(impl-trait .token-traits.extendable-token-actions-v1)
+(impl-trait .token-traits.extendable-token)
+
+(use-trait token-extension .token-traits.token-extension)
+(use-trait extendable-token-actions-v1 .token-traits.extendable-token-actions-v1)
+
+(define-constant ERR-NOT-AUTHORIZED (err u10000))
+(define-constant ERR-MINT-ALLOWANCE-OVERFLOW (err u10001))
+(define-constant ERR-PRINCIPAL-INVALID (err u10002))
+(define-constant ERR-AMOUNT-INVALID (err u10003))
+(define-constant ERR-TOKEN-PAUSED (err u10004))
+
+(define-constant PRECISION u8)
+(define-map authorized-extensions principal bool)
+
+(define-data-var token-uri (string-utf8 256) u""http://url.to/token-metadata.json"")
+(define-data-var name (string-ascii 32) ""USDC.e (Bridged by X)"")
+(define-data-var symbol (string-ascii 32) ""USDC.e"")
+(define-data-var contract-owner principal contract-caller)
+
+(define-fungible-token token-data)
+
+(define-map minters-allowances principal uint)
+
+(define-map minters-allowances-tracking principal uint)
+
+(define-data-var token-pause bool true)
+
+(define-public (set-minter-allowance (minter principal) (allowance uint))
+	(begin
+		;; Ensure that the actor calling this contract is allowed to do so
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		;; Update minter's allowance
+		(map-set minters-allowances minter allowance)
+		;; Emit an event to increase observability
+		(print { type: ""allowance"", action: ""update"", object: { minter: minter, allowance: allowance } })
+		;; Ok response
+		(ok { minter: minter, allowance: allowance })))
+
+(define-read-only (is-token-paused)
+  	(ok (var-get token-pause)))
+
+(define-public (pause-token)
+	(begin
+		;; Ensure that the actor calling this contract is allowed to do so
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		;; Pause token
+		(var-set token-pause true)
+		;; Emit an event to increase observability
+		(print { type: ""token"", action: ""paused"" })
+		;; Ok response
+		(ok true)))
+
+(define-public (unpause-token)
+	(begin
+		;; Ensure that the actor calling this contract is allowed to do so
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		;; Unpause token
+		(var-set token-pause false)
+		;; Emit an event to increase observability
+		(print { type: ""token"", action: ""paused"" })
+		;; Ok response
+		(ok true)))
+
+;;;; SIP-10 trait implementation
+;; The logic of these functions will not be upgradable.
+;; Constraint: we'd need to have them right from the get go.
+
+(define-read-only (get-total-supply)
+  	(ok (ft-get-supply token-data)))
+
+(define-read-only (get-name)
+  	(ok (var-get name)))
+
+(define-read-only (get-symbol)
+  	(ok (var-get symbol)))
+
+(define-read-only (get-decimals)
+   	(ok PRECISION))
+
+(define-read-only (get-balance (account principal))
+  	(ok (ft-get-balance token-data account)))
+
+(define-read-only (get-token-uri)
+  	(ok (some (var-get token-uri))))
+
+(define-public (transfer 
+		(amount uint) 
+		(sender principal) 
+		(recipient principal) 
+		(memo (optional (buff 34))))
+	;; All-bridge requirement - To be explored
+	(transfer! amount sender recipient memo))
+
+;;;; Ownership management
+
+(define-read-only (get-contract-owner)
+  	(ok (var-get contract-owner)))
+
+(define-public (set-contract-owner (owner principal))
+	(begin
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		(asserts! (is-standard owner) ERR-NOT-AUTHORIZED)
+		(ok (var-set contract-owner owner))))
+
+;;;; Token Extensions
+;;;; Functions available for the token extensions
+
+(define-public (set-token-uri (value (string-utf8 256)))
+	(begin
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		(ok (var-set token-uri value))))
+
+(define-public (set-token-name (value (string-ascii 32)))
+	(begin
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		(ok (var-set name value))))
+
+(define-public (set-token-symbol (value (string-ascii 32)))
+	(begin
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		(ok (var-set symbol value))))
+
+(define-map banned-addresses principal bool)
+
+(define-public (ban-address (address principal))
+	(begin
+		;; Check ACL
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		;; Ban address
+		(map-set banned-addresses address true)
+		(ok address)))
+
+(define-public 
+	(unban-address 
+		(address principal)
+	)
+	(begin
+		;; Check ACL
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		;; Ban address
+		(map-delete banned-addresses address)
+		(ok address)))
+
+;; Mint tokens
+(define-public (mint! (recipient principal) (amount uint) (memo (optional (buff 34))))
+	(let ((minting-allowance (unwrap! (map-get? minters-allowances contract-caller) ERR-NOT-AUTHORIZED))
+		  (minted-pre-op (default-to u0 (map-get? minters-allowances-tracking contract-caller)))
+		  (minted-post-op (+ minted-pre-op amount)))
+		;; Ensure that token is not paused
+		(asserts! (is-eq (var-get token-pause) false) ERR-TOKEN-PAUSED)
+		;; Ensure that minter can mint
+		(asserts! (>= amount u0) ERR-AMOUNT-INVALID)
+		;; Ensure that minter can mint
+		(asserts! (>= minting-allowance minted-post-op) ERR-MINT-ALLOWANCE-OVERFLOW)
+		;; Mint tokens
+		(unwrap-panic (ft-mint? token-data amount recipient))
+		;; Update allowance tracking
+		(map-set minters-allowances-tracking contract-caller minted-post-op)
+		;; Emit memo event
+		(print memo)
+		;; Return Ok
+		(ok true)))
+
+;; Burn tokens
+(define-public (burn! (sender principal) (amount uint) (memo (optional (buff 34))))
+	(begin
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		;; Ensure that token is not paused
+		(asserts! (is-eq (var-get token-pause) false) ERR-TOKEN-PAUSED)
+		(match 
+			(ft-burn? token-data amount sender)
+			response (begin
+				(print memo)
+				(ok response)
+			)
+			error (err error))))
+
+;; Transfer tokens
+(define-public (transfer! 
+		(amount uint)
+		(sender principal)
+		(recipient principal)
+		(memo (optional (buff 34))))
+	(begin 
+		;; Ensure amount is positive
+		(asserts! (> amount u0) ERR-AMOUNT-INVALID)
+		;; Ensure the sender is not banned
+		(asserts! (is-none (map-get? banned-addresses sender)) ERR-NOT-AUTHORIZED)
+		;; Ensure the recipient is not banned
+		(asserts! (is-none (map-get? banned-addresses recipient)) ERR-NOT-AUTHORIZED)
+		;; Ensure that token is not paused
+		(asserts! (is-eq (var-get token-pause) false) ERR-TOKEN-PAUSED)
+		;; Ensure that send tokens are owned by the tx-sender
+		(asserts! (is-eq sender tx-sender) ERR-NOT-AUTHORIZED)
+		(match 
+			(ft-transfer? token-data amount sender recipient)
+			response (begin
+				(print memo)
+				(ok response)
+			)
+			error (err error))))
+
+;; Extension management
+
+(define-public (authorize-extension (extension <token-extension>))
+	(begin 
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		(print { type: ""extension"", action: ""authorized"", object: { extension: extension } })
+        (map-insert authorized-extensions (contract-of extension) true)
+        (ok true)))
+
+(define-public (deauthorize-extension (extension <token-extension>))
+	(begin 
+		(asserts! (is-eq contract-caller (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+		(print { type: ""extension"", action: ""deprecated"", object: { extension: extension } })
+        (map-delete authorized-extensions (contract-of extension))
+        (ok true)))
+
+(define-public (run-extension! 
+		(self <extendable-token-actions-v1>)
+		(extension <token-extension>)
+		(payload (buff 8192)))
+	(begin
+        (asserts! (is-eq (as-contract tx-sender) (contract-of self)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (map-get? authorized-extensions (contract-of extension)) (some true)) ERR-NOT-AUTHORIZED)
+		(as-contract (contract-call? extension run! self payload))))"
+"Develop a Clarity smart contract for the Stacks blockchain that acts as a simple banking system or digital piggy bank. Users should be able to deposit and withdraw STX tokens, with balances stored in an account map. The contract must include secure deposit handling, multiple withdrawal methods demonstrating different security levels (including one intentionally insecure to teach risks), and allow administrators to access any account. Implement a time-restricted withdrawal feature that only works after a specified block height. Add clear documentation on security measures, input checks, error handling with constants, and use Clarity-specific safety tools like assertions and conditional guards.","The solution begins by outlining all user requirements: tracking STX balances via a data map, secure deposit/withdrawal logic with varying implementations, administrator privileges, time-based restrictions, and educational security explanations. The contract first defines error codes for clarity and consistency, fulfilling the error-handling directive. A 'user-accounts' map is set to store balances, directly addressing the balance-tracking requirement. Deposit functionality safely transfers STX while noting edge cases for atomicity. Three withdrawal approaches are created: an unsafe version omitting balance checks to illustrate risks, a standard method using assertions for validation, and a modular version using helper functions. A privileged 'admin-withdraw' accesses any account after verifying authentication. The time-based feature uses block-height checks against a predefined value to unlock funds. Read-access functions like 'check-balance' ensure transparency without altering state. Comments throughout explain dangers of unchecked inputs, the importance of atomic transfers, and security best practices in Clarity, such as using 'asserts' and 'cond' guards. Each function's design emphasizes contrasting safe vs. unsafe patterns to highlight development pitfalls.",";; bank
+;; This contract serves as a simple piggy bank, where users can deposit STX
+;; and withdrawal it later. It serves as an example program to demonstrate
+;; features of the check-checker.
+
+;; constants
+(define-constant err-insufficient-balance (err u1))
+(define-constant err-unauthorized (err u2))
+
+;; data maps and vars
+(define-map accounts { holder: principal } { amount: int })
+
+;; public functions
+
+;; A user deposits money into the piggy bank.
+(define-public (deposit (amount uint))
+    (let ((balance (default-to 0 (get amount (map-get? accounts {holder: tx-sender})))))
+        ;; A user should be allowed to specify any amount to deposit, and the
+        ;; `stx-transfer?` will fail and rollback all operations if the sender
+        ;; does not have enough STX, so it is safe to allow the unchecked data
+        ;; here.
+        ;; #[allow(unchecked_data)]
+        (map-set accounts {holder: tx-sender} {amount: (+ balance (to-int amount))})
+        (stx-transfer? amount tx-sender (as-contract tx-sender))
+    )
+)
+
+;; A user withdrawals from the piggy bank.
+;; This unsafe implementation of withdrawal forgets to include a check on the
+;; amount. See the tests for what can happen!
+(define-public (withdrawal-unsafe (amount uint))
+    (let (
+          (balance (default-to 0 (get amount (map-get? accounts {holder: tx-sender}))))
+          (customer tx-sender)
+         )
+         ;; `balance` is tainted by the untrusted input, `amount`, so the
+         ;; check-checker reports a warning when it is written into a map.
+        (map-set accounts {holder: tx-sender} {amount: (- balance (to-int amount))})
+        ;; `amount` is untrusted input, so it is dangerous to use it in a
+        ;; `stx_transfer?` call.
+        (as-contract (stx-transfer? amount tx-sender customer))
+    )
+)
+
+;; A user withdrawals from the piggy bank.
+(define-public (withdrawal (amount uint))
+    (let (
+          (balance (default-to 0 (get amount (map-get? accounts {holder: tx-sender}))))
+          (customer tx-sender)
+         )
+        ;; This `asserts!` is a check on `amount`, allowing it to be used
+        ;; without warnings from the check-checker.
+        (asserts! (>= balance (to-int amount)) err-insufficient-balance)
+        (map-set accounts {holder: tx-sender} {amount: (- balance (to-int amount))})
+        (as-contract (stx-transfer? amount tx-sender customer))
+    )
+)
+
+;; A user withdrawals from the piggy bank.
+;; This version of withdrawal uses an 'if'.
+(define-public (withdrawal-if (amount uint))
+    (let (
+          (balance (default-to 0 (get amount (map-get? accounts {holder: tx-sender}))))
+          (customer tx-sender)
+         )
+        ;; Here is another example of a way to check the untrusted input.
+        (if (<= (to-int amount) balance)
+            (begin
+                (map-set accounts {holder: tx-sender} {amount: (- balance (to-int amount))})
+                (as-contract (stx-transfer? amount tx-sender customer))
+            )
+            err-insufficient-balance
+        )
+    )
+)
+
+;; Check that the amount is less than or equal to the balance.
+(define-private (check-balance (amount uint))
+    (let ((balance (default-to 0 (get amount (map-get? accounts {holder: tx-sender})))))
+        (asserts! (<= (to-int amount) balance) err-insufficient-balance)
+        (ok true)
+    )
+)
+
+;; A user withdrawals from the piggy bank.
+;; This version of withdrawal calls another function to perform the check.
+(define-public (withdrawal-callee-filter (amount uint))
+    (let (
+          (balance (default-to 0 (get amount (map-get? accounts {holder: tx-sender}))))
+          (customer tx-sender)
+         )
+        ;; This call to `check-balance` serves as a check on `amount`, if the
+        ;; `callee_filter` option is enabled.
+        (try! (check-balance amount))
+        (map-set accounts {holder: tx-sender} {amount: (- balance (to-int amount))})
+        (as-contract (stx-transfer? amount tx-sender customer))
+    )
+)
+
+;; Retrieve the sender's balance.
+(define-read-only (get-balance)
+    (default-to 0 (get amount (map-get? accounts {holder: tx-sender})))
+)
+
+(define-data-var bank-owner principal tx-sender)
+
+;; The owner of the bank can take money from any account.
+(define-public (take (amount uint) (from principal))
+    (let (
+          (balance (- (default-to 0 (get amount (map-get? accounts {holder: from}))) (to-int amount)))
+          (banker tx-sender)
+        )
+        ;; When the `trusted_sender` option is enabled, the check on
+        ;; `tx-sender` below tells the check-checker that this is a trusted
+        ;; sender, so we trust all inputs. If you disable this option (in
+        ;; Clarinet.toml) you will see warnings on the uses below.
+        (asserts! (is-eq tx-sender (var-get bank-owner)) err-unauthorized)
+        (map-set accounts {holder: from} {amount: balance})
+        (as-contract (stx-transfer? amount tx-sender banker))
+    )
+)
+
+(define-data-var expiration-height uint u100)
+
+;; If a certain block has passed, any user can take money out of any account.
+(define-public (take-after-time (amount uint) (from principal))
+    (let ((balance (- (default-to 0 (get amount (map-get? accounts {holder: from}))) (to-int amount))))
+        (asserts! (>= balance (to-int amount)) err-insufficient-balance)
+        ;; The annotation `filter(from)` tells the check-checker to consider
+        ;; the variable `from` to be considered filtered by the asserts below.
+        ;; Without this annotation, the check-checker would report a warning
+        ;; on the `map-set`.
+        ;; #[filter(from)]
+        (asserts! (> block-height (var-get expiration-height)) err-unauthorized)
+        (map-set accounts {holder: from} {amount: balance})
+        (stx-transfer? amount (as-contract tx-sender) tx-sender)
+    )
+)"
+"Develop a Clarity smart contract for a fundraising initiative on the Stacks blockchain that accepts contributions in STX and sBTC tokens. The contract must include initialization parameters for a funding target and campaign timeline, with a default duration of 30 days (measured in Bitcoin blocks). It should record donations per donor address, permit the campaign manager to terminate the initiative, allow donors to seek refunds upon cancellation, and authorize the beneficiary to claim funds after the campaign concludes. Include error handling mechanisms, read-only functions to monitor campaign progress and contribution details, and strict permissions to ensure secure access. Maintain records of total funds raised, campaign status, and individual donation values.","Initially, the goal is to develop a fundraising contract for Stacks blockchain, requiring secure state tracking and transaction handling. The contract must store key information like initialization status, beneficiary identity, timeline details (duration and start), financial goals, and contribution data. This data is managed via variables and maps (for STX/sBTC donations indexed by contributor addresses). Defining error constants with clear codes (e.g., 'unauthorized-action' or 'campaign-expired') enhances readability and error reporting. The initialization method enforces authorization by the deployer, verifies unstarted campaigns, and sets parameters with a default 30-day timeframe (converted into BTC block numbers). Cancellation logic ensures only authorized users can halt active campaigns before funds are disbursed. Contribution methods for STX and sBTC confirm campaign activity, update balances, and log donations. Withdrawal can only occur after the deadline, via beneficiary authorization, transferring both token types securely. Refunds are processed only if canceled, returning saved donations while removing records. Read-only functions enable visibility into campaign status, individual contributions, and overall metrics. The structure ensures all requirements are fulfilled with robust security and state integrity.",";; Fundraising Campaign Contract
+;; A simple contract to accept crypto donations in STX or sBTC.
+
+;; Constants 
+(define-constant contract-owner tx-sender)
+(define-constant err-not-authorized (err u100))
+(define-constant err-campaign-ended (err u101))
+(define-constant err-not-initialized (err u102))
+(define-constant err-not-cancelled (err u103))
+(define-constant err-campaign-not-ended (err u104))
+(define-constant err-campaign-cancelled (err u105))
+(define-constant err-already-initialized (err u106))
+(define-constant err-already-withdrawn (err u107))
+
+(define-constant default-duration u4320) ;; Duration in *Bitcoin* blocks. This default value means is if a block is 10 minutes, this is roughly 30 days.
+
+;; Data vars
+(define-data-var is-campaign-initialized bool false)
+(define-data-var is-campaign-cancelled bool false)
+(define-data-var beneficiary principal contract-owner)
+(define-data-var campaign-duration uint u173000)
+(define-data-var campaign-start uint u0)
+(define-data-var campaign-goal uint u0)
+(define-data-var total-stx uint u0) ;; in microstacks
+(define-data-var total-sbtc uint u0) ;; in sats
+(define-data-var donation-count uint u0)
+(define-data-var is-campaign-withdrawn bool false)
+
+;; Maps
+(define-map stx-donations principal uint)  ;; donor -> amount
+(define-map sbtc-donations principal uint) ;; donor -> amount
+
+;; Initialize the campaign (goal in US dollars)
+;; Pass duration as 0 to use the default duration (~30 days)
+;; Can only be called once
+(define-public (initialize-campaign (goal uint) (duration uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (not (var-get is-campaign-initialized)) err-already-initialized)
+    (var-set is-campaign-initialized true)
+    (var-set campaign-start burn-block-height)
+    (var-set campaign-goal goal)
+    (var-set campaign-duration duration)
+    (var-set campaign-duration (if (is-eq duration u0) 
+      default-duration
+      duration))
+    (ok true)))
+
+;; Cancel the campaign
+;; Only the owner can call this, at any time during or after the campaign
+;; Allows donors to get a refund
+;; Can only be called once
+(define-public (cancel-campaign)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (var-get is-campaign-initialized) err-not-initialized)
+    (asserts! (not (var-get is-campaign-withdrawn)) err-already-withdrawn)
+    (var-set is-campaign-cancelled true)
+    (ok true)))
+
+;; Donate STX. Pass amount in microstacks.
+(define-public (donate-stx (amount uint))
+  (begin
+    (asserts! (var-get is-campaign-initialized) err-not-initialized)
+    (asserts! (not (var-get is-campaign-cancelled)) err-campaign-cancelled)
+    (asserts! (< burn-block-height (+ (var-get campaign-start) (var-get campaign-duration))) 
+              err-campaign-ended)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set stx-donations tx-sender 
+      (+ (default-to u0 (map-get? stx-donations tx-sender)) amount))
+    (var-set total-stx (+ (var-get total-stx) amount))
+    (var-set donation-count (+ (var-get donation-count) u1))
+    (ok true)))
+
+;; Donate sBTC. Pass amount in Satoshis.
+(define-public (donate-sbtc (amount uint))
+  (begin
+    (asserts! (var-get is-campaign-initialized) err-not-initialized)
+    (asserts! (not (var-get is-campaign-cancelled)) err-campaign-cancelled)
+    (asserts! (< burn-block-height (+ (var-get campaign-start) (var-get campaign-duration))) 
+              err-campaign-ended)
+    (try! (contract-call? 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token transfer
+      amount 
+      contract-caller
+      (as-contract tx-sender) 
+      none))
+    (map-set sbtc-donations tx-sender
+      (+ (default-to u0 (map-get? sbtc-donations tx-sender)) amount))
+    (var-set total-sbtc (+ (var-get total-sbtc) amount))
+    (var-set donation-count (+ (var-get donation-count) u1))
+    (ok true)))
+
+;; Withdraw funds (only beneficiary, only if campaign is ended)
+(define-public (withdraw)
+  (let (
+    (total-stx-amount (var-get total-stx))
+    (total-sbtc-amount (var-get total-sbtc))
+  )
+    (asserts! (var-get is-campaign-initialized) err-not-initialized)
+    (asserts! (not (var-get is-campaign-cancelled)) err-campaign-cancelled)
+    (asserts! (not (var-get is-campaign-withdrawn)) err-already-withdrawn)
+    (asserts! (is-eq tx-sender (var-get beneficiary)) err-not-authorized)
+    (asserts! (>= burn-block-height (+ (var-get campaign-start) (var-get campaign-duration)))
+              err-campaign-not-ended)
+    (as-contract
+      (begin
+        (if (> total-stx-amount u0)
+          (try! (stx-transfer? total-stx-amount (as-contract tx-sender) (var-get beneficiary)))
+          true)
+        (if (> total-sbtc-amount u0)
+          (try! (contract-call? 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token transfer
+            total-sbtc-amount
+            (as-contract tx-sender)
+            (var-get beneficiary)
+            none))
+          true)
+        (var-set is-campaign-withdrawn true)
+        (ok true)))))
+
+;; Refund to donor
+;; Campaign owner can choose to allow this by cancelling the campaign
+(define-public (refund)
+  (let (
+    (stx-amount (default-to u0 (map-get? stx-donations tx-sender)))
+    (sbtc-amount (default-to u0 (map-get? sbtc-donations tx-sender)))
+    (contributor tx-sender)
+  )
+    (asserts! (var-get is-campaign-cancelled) err-not-cancelled)
+    (if (> stx-amount u0)
+      (begin
+        (as-contract
+          (try! (stx-transfer? stx-amount tx-sender contributor))))
+      true)
+      (map-delete stx-donations tx-sender)
+    (if (> sbtc-amount u0)
+      (begin
+        (as-contract
+          (try! (contract-call? 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token transfer
+            sbtc-amount
+            tx-sender
+            contributor
+            none))))
+      true)
+      (map-delete sbtc-donations tx-sender)
+    (ok true)))
+
+;; Getter functions
+(define-read-only (get-stx-donation (donor principal))
+  (ok (default-to u0 (map-get? stx-donations donor))))
+
+(define-read-only (get-sbtc-donation (donor principal))
+  (ok (default-to u0 (map-get? sbtc-donations donor))))
+
+(define-read-only (get-campaign-info)
+  (ok {
+    start: (var-get campaign-start),
+    end: (+ (var-get campaign-start) (var-get campaign-duration)),
+    goal: (var-get campaign-goal),
+    totalStx: (var-get total-stx),
+    totalSbtc: (var-get total-sbtc),
+    donationCount: (var-get donation-count),
+    isExpired: (>= burn-block-height (+ (var-get campaign-start) (var-get campaign-duration))),
+    isWithdrawn: (var-get is-campaign-withdrawn),
+    isCancelled: (var-get is-campaign-cancelled),
+  }))
+
+(define-read-only (get-contract-balance)
+  (stx-get-balance (as-contract tx-sender)))"
+"Develop a Clarity-based smart contract for the Stacks Blockchain that enables a payment streaming system. The contract must permit users to establish sBTC payment streams that distribute funds incrementally from sender to recipient over a defined block count. Include features for initiating streams, adding funds to existing streams, allowing recipients to claim accrued payments, enabling senders to reclaim unused funds post-stream completion, and permitting parameter adjustments with mutual approval confirmed via cryptographic signatures. Maintain a data structure tracking stream details like sender, recipient, remaining balance, withdrawn amount, payment speed, and time parameters. Incorporate safeguards against unauthorized actions, signature mismatches, active stream interference, and invalid stream references. Also, include utility functions to compute available funds and block intervals.","First, I must grasp the contract's objective: creating a Stacks Blockchain payment streaming system using Clarity. The core idea involves transferring sBTC gradually over a block-defined timeframe instead of a single transfer. For state management, a mapping structure will track each stream's details using unique identifiers, managed by an incrementing ID counter. The 'create-stream' function will initialize parameters, lock sender funds, and return the stream ID, ensuring the sender is the transaction initiator. A 'refuel' function lets senders add funds to existing streams, validated against their identity. To track streamed amounts, helper functions calculate elapsed blocks and derived balances using payment rates and time boundaries. Recipients withdraw earnings via a 'withdraw' function verified against their address, while 'refund' allows senders to reclaim residual funds post-stream end. Stream parameter updates require both parties' cryptographic approval, enforced through signature validation of proposed changes. Error handling includes restrictions for unauthorized access, invalid signatures, active streams, and non-existent IDs. Read-only functions like 'balance-of' optimize gas costs by avoiding state changes. Token transfers use the sBTC contract interface, with the main contract acting as intermediary to ensure secure fund management throughout the stream lifecycle.",";; payment-stream.clar
+
+;; Error codes
+(define-constant ERR_UNAUTHORIZED (err u0))
+(define-constant ERR_INVALID_SIGNATURE (err u1))
+(define-constant ERR_STREAM_STILL_ACTIVE (err u2))
+(define-constant ERR_INVALID_STREAM_ID (err u3))
+
+;; Data vars
+(define-data-var latest-stream-id uint u0)
+(define-data-var nonce uint u0)
+
+;; Streams mapping
+(define-map streams
+    uint  ;; stream-id
+    {
+        sender: principal,
+        recipient: principal,
+        balance: uint,
+        withdrawn-balance: uint,
+        payment-per-block: uint,
+        timeframe: (tuple (start-block uint) (stop-block uint))
+    }
+)
+
+;; Create a new stream
+(define-public (stream-to
+    (recipient principal)
+    (initial-balance uint)
+    (timeframe (tuple (start-block uint) (stop-block uint)))
+    (payment-per-block uint)
+)
+    (let (
+        (stream {
+            sender: contract-caller,
+            recipient: recipient,
+            balance: initial-balance,
+            withdrawn-balance: u0,
+            payment-per-block: payment-per-block,
+            timeframe: timeframe
+        })
+        (current-stream-id (var-get latest-stream-id))
+    )
+        ;; Transfer sBTC from sender to contract
+        (try! (contract-call?
+            .sbtc-token
+            transfer
+            initial-balance
+            contract-caller
+            (as-contract tx-sender)
+            none
+        ))
+        (map-set streams current-stream-id stream)
+        (var-set latest-stream-id (+ current-stream-id u1))
+        (ok current-stream-id)
+    )
+)
+
+;; Increase the locked sBTC balance for a stream
+(define-public (refuel
+    (stream-id uint)
+    (amount uint)
+  )
+  (let (
+    (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
+  )
+    (asserts! (is-eq contract-caller (get sender stream)) ERR_UNAUTHORIZED)
+    (try! (contract-call?
+      .sbtc-token
+      transfer
+      amount
+      contract-caller
+      (as-contract tx-sender)
+      none
+    ))
+    (map-set streams stream-id
+      (merge stream {balance: (+ (get balance stream) amount)})
+    )
+    (ok amount)
+  )
+)
+
+;; Check balance for a party involved in a stream
+(define-read-only (balance-of
+    (stream-id uint)
+    (who principal)
+  )
+  (let (
+    (stream (unwrap! (map-get? streams stream-id) u0))
+    (block-delta (calculate-block-delta (get timeframe stream)))
+    (recipient-balance (* block-delta (get payment-per-block stream)))
+  )
+    (if (is-eq who (get recipient stream))
+      (- recipient-balance (get withdrawn-balance stream))
+      (if (is-eq who (get sender stream))
+        (- (get balance stream) recipient-balance)
+        u0
+      )
+    )
+  )
+)
+
+;; Calculate the number of blocks a stream has been active
+(define-read-only (calculate-block-delta
+    (timeframe (tuple (start-block uint) (stop-block uint)))
+  )
+  (let (
+    (start-block (get start-block timeframe))
+    (stop-block (get stop-block timeframe))
+
+    (delta
+      (if (<= block-height start-block)
+        ;; then
+        u0
+        ;; else
+        (if (< block-height stop-block)
+          ;; then
+          (- block-height start-block)
+          ;; else
+          (- stop-block start-block)
+        )
+      )
+    )
+  )
+    delta
+  )
+)
+
+;; Withdraw received tokens
+(define-public (withdraw
+    (stream-id uint)
+  )
+  (let (
+    (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
+    (balance (balance-of stream-id contract-caller))
+  )
+    (asserts! (is-eq contract-caller (get recipient stream)) ERR_UNAUTHORIZED)
+    (map-set streams stream-id
+      (merge stream {withdrawn-balance: (+ (get withdrawn-balance stream) balance)})
+    )
+    (try! (as-contract (contract-call?
+      .sbtc-token
+      transfer
+      balance
+      tx-sender
+      (get recipient stream)
+      none
+    )))
+    (ok balance)
+  )
+)
+
+;; Withdraw excess locked tokens
+(define-public (refund
+    (stream-id uint)
+  )
+  (let (
+    (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
+    (balance (balance-of stream-id (get sender stream)))
+  )
+    (asserts! (is-eq contract-caller (get sender stream)) ERR_UNAUTHORIZED)
+    (asserts! (< (get stop-block (get timeframe stream)) block-height) ERR_STREAM_STILL_ACTIVE)
+    (map-set streams stream-id (merge stream {
+        balance: (- (get balance stream) balance),
+      }
+    ))
+    (try! (as-contract (contract-call?
+      .sbtc-token
+      transfer
+      balance
+      tx-sender
+      (get sender stream)
+      none
+    )))
+    (ok balance)
+  )
+)
+
+;; Get hash of stream
+(define-read-only (hash-stream
+    (stream-id uint)
+    (new-payment-per-block uint)
+    (new-timeframe (tuple (start-block uint) (stop-block uint)))
+  )
+  (let (
+    (stream (unwrap! (map-get? streams stream-id) (sha256 0)))
+    (msg (concat (concat (unwrap-panic (to-consensus-buff? stream)) (unwrap-panic (to-consensus-buff? new-payment-per-block))) (unwrap-panic (to-consensus-buff? new-timeframe))))
+  )
+    (sha256 msg)
+  )
+)
+
+;; Signature verification
+(define-read-only (validate-signature (hash (buff 32)) (signature (buff 65)) (signer principal))
+  (is-eq
+    (principal-of? (unwrap! (secp256k1-recover? hash signature) false))
+    (ok signer)
+  )
+)
+
+;; Update stream configuration
+(define-public (update-details
+    (stream-id uint)
+    (payment-per-block uint)
+    (timeframe (tuple (start-block uint) (stop-block uint)))
+    (signer principal)
+    (signature (buff 65))
+  )
+  (let (
+    (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
+  )
+    (asserts! (validate-signature (hash-stream stream-id payment-per-block timeframe) signature signer) ERR_INVALID_SIGNATURE)
+    (asserts!
+      (or
+        (and (is-eq (get sender stream) contract-caller) (is-eq (get recipient stream) signer))
+        (and (is-eq (get sender stream) signer) (is-eq (get recipient stream) contract-caller))
+      )
+      ERR_UNAUTHORIZED
+    )
+    (map-set streams stream-id (merge stream {
+        payment-per-block: payment-per-block,
+        timeframe: timeframe
+    }))
+    (ok true)
+  )
+)"
+"Design a Clarity smart contract named 'timelocked-wallet' for the Stacks blockchain that implements a time-locked token vault. The contract must allow its owner to securely lock STX tokens for a beneficiary until a specified block height. Include functions to: 1) lock funds with owner auth, beneficiary, unlock block and deposit; 2) transfer beneficiary rights via 'bestow'; and 3) claim funds post-unlock. Enforce: single locking, future unlock block validation, positive balances, owner/exclusivity checks. Track beneficiary (none initially) and unlock block (0 initially) in variables. Add error codes and documentation.","I begin by analyzing the requirement to build a STX time-lock contract with specific access controls. FirstStep: Defining contract structure and ownership logic using tx-sender as deployer. Next: Establishing error codes for all stated conditions: invalid owner actions, existing locks, past unlock heights, zero deposits, non-beneficiary operations, and premature claims. Variables: An optional principal for beneficiary allows null up front, while unlocking block is stored as numeric value. LockFn implements ownership checks, future block validation (time_cmp?), zero-check on deposits, and transfers STX to contract. BestowFn: Validates current beneficiary as sender before transferring entitlement. ClaimFn uses time comparison to confirm post-unlock, then transfers full balance to beneficiary using contract's own execution context. EdgeCases: unwrap-panic ensures beneficiary exists before transfer; as-contract correct STX transfer permissions. FinalStep: Validate all guards, document each function purpose, and test mock input scenarios.",";; timelocked-wallet
+;; A time-locked vault contract that becomes eligible to claim by the beneficiary after a certain block-height has been reached.
+
+;; Owner
+(define-constant contract-owner tx-sender)
+
+;; Errors
+(define-constant err-owner-only (err u100))
+(define-constant err-already-locked (err u101))
+(define-constant err-unlock-in-past (err u102))
+(define-constant err-no-value (err u103))
+(define-constant err-beneficiary-only (err u104))
+(define-constant err-unlock-height-not-reached (err u105))
+
+;; Data
+(define-data-var beneficiary (optional principal) none)
+(define-data-var unlock-height uint u0)
+
+(define-public (lock (new-beneficiary principal) (unlock-at uint) (amount uint))
+	(begin
+		(asserts! (is-eq tx-sender contract-owner) err-owner-only)
+		(asserts! (is-none (var-get beneficiary)) err-already-locked)
+		(asserts! (> unlock-at block-height) err-unlock-in-past)
+		(asserts! (> amount u0) err-no-value)
+		(try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+		(var-set beneficiary (some new-beneficiary))
+		(var-set unlock-height unlock-at)
+		(ok true)
+	)
+)
+
+(define-public (bestow (new-beneficiary principal))
+	(begin
+		(asserts! (is-eq (some tx-sender) (var-get beneficiary)) err-beneficiary-only)
+		(var-set beneficiary (some new-beneficiary))
+		(ok true)
+	)
+)
+
+(define-public (claim)
+	(begin
+		(asserts! (is-eq (some tx-sender) (var-get beneficiary)) err-beneficiary-only)
+		(asserts! (>= block-height (var-get unlock-height)) err-unlock-height-not-reached)
+		(as-contract (stx-transfer? (stx-get-balance tx-sender) tx-sender (unwrap-panic (var-get beneficiary))))
+	)
+)"
+"Develop a Clarity smart contract for a fungible token on the Stacks blockchain named 'Clarity Coin' with the symbol 'CC', adhering to the SIP-010 standard. The token must have no set maximum supply and restrict minting privileges exclusively to the contract owner. The contract should include transfer functionality with sender authorization checks and an optional memo parameter, along with all required read-only methods (get-name, get-symbol, get-decimals, get-balance, get-total-supply, get-token-uri). Also include error codes for unauthorized minting and invalid transfers.","First, adopt the SIP-010 fungible token trait by referencing the standard contract at 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait'. This enforces the required token interface. Ownership is set by defining the deployer address as contract-owner. Error codes 'err-owner-only' (u100) and 'err-invalid-transfer' (u101) are established to handle access violations. The 'clarity-coin' token is created without a supply cap via the fungible-token! form. The transfer function validates the transaction sender matches the declared sender, executes the transfer using ft-transfer?, and processes memo via optional buffer handling. Read-only functions return static values for name/symbol, decimals (u0), and delegate balances/supply queries to standard functions. The mint function checks tx-sender against contract-owner before using ft-mint? to issue tokens. All SIP-010 requirements are addressed through this implementation.","(impl-trait 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
+
+(define-constant contract-owner tx-sender)
+(define-constant err-owner-only (err u100))
+(define-constant err-not-token-owner (err u101))
+
+;; No maximum supply!
+(define-fungible-token clarity-coin)
+
+(define-public (transfer (amount uint) (sender principal) (recipient principal) (memo (optional (buff 34))))
+	(begin
+		(asserts! (is-eq tx-sender sender) err-not-token-owner)
+		(try! (ft-transfer? clarity-coin amount sender recipient))
+		(match memo to-print (print to-print) 0x)
+		(ok true)
+	)
+)
+
+(define-read-only (get-name)
+	(ok ""Clarity Coin"")
+)
+
+(define-read-only (get-symbol)
+	(ok ""CC"")
+)
+
+(define-read-only (get-decimals)
+	(ok u0)
+)
+
+(define-read-only (get-balance (who principal))
+	(ok (ft-get-balance clarity-coin who))
+)
+
+(define-read-only (get-total-supply)
+	(ok (ft-get-supply clarity-coin))
+)
+
+(define-read-only (get-token-uri)
+	(ok none)
+)
+
+(define-public (mint (amount uint) (recipient principal))
+	(begin
+		(asserts! (is-eq tx-sender contract-owner) err-owner-only)
+		(ft-mint? clarity-coin amount recipient)
+	)
+)"
+"Develop a Stacks blockchain NFT smart contract using Clarity that adheres to the nft-trait standard. The contract must manage an NFT collection named 'stacksies' with token IDs assigned sequentially via a data variable. Include owner-only minting capabilities, user-based token transfers, and read-only functions to retrieve the latest token ID, token metadata (URI), and ownership details. Implement access controls to restrict minting to the contract owner and transfers to token owners, with Clarity best practices including clear constants, data variables, and function separation.","First, I must determine the requirements: building an NFT contract on Stacks that meets the nft-trait standard, tracks tokens as 'stacksies', and includes necessary operations with robust error handling. The solution requires defining the contract interface, setting owner permissions, enabling sequential token minting, and offering query functions for metadata and ownership. The contract begins by importing the standard NFT interface to ensure compliance. Constants for the owner and errors are established upfront. Token IDs are managed via a data variable incremented during minting. Read accessors like get-last-token-id and get-owner provide state visibility. Transfer functionality enforces sender verification using asserts!, while minting restricts execution to the owner. The implementation avoids redundancy, uses error-returning functions for safety, and separates public (mint/transfer) from query functions as best practices dictate.","(impl-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+
+(define-constant contract-owner tx-sender)
+(define-constant err-owner-only (err u100))
+(define-constant err-not-token-owner (err u101))
+
+(define-non-fungible-token stacksies uint)
+
+(define-data-var last-token-id uint u0)
+
+(define-read-only (get-last-token-id)
+	(ok (var-get last-token-id))
+)
+
+(define-read-only (get-token-uri (token-id uint))
+	(ok none)
+)
+
+(define-read-only (get-owner (token-id uint))
+	(ok (nft-get-owner? stacksies token-id))
+)
+
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+	(begin
+		(asserts! (is-eq tx-sender sender) err-not-token-owner)
+		(nft-transfer? stacksies token-id sender recipient)
+	)
+)
+
+(define-public (mint (recipient principal))
+	(let
+		(
+			(token-id (+ (var-get last-token-id) u1))
+		)
+		(asserts! (is-eq tx-sender contract-owner) err-owner-only)
+		(try! (nft-mint? stacksies token-id recipient))
+		(var-set last-token-id token-id)
+		(ok token-id)
+	)
+)"
+"Develop a Clarity smart contract on the Stacks blockchain that fetches real-time price information for an asset, like BTC/USD, via the Stacks-Pyth Bridge. Ensure the contract includes deployment and testing guidance.","First, I'll determine the essential steps to integrate the Pyth Network with Stacks using the Bridge. Key constants for the Pyth Oracle and storage contract addresses, alongside the BTC/USD feed identifier in hex, must be defined using define-constant to ensure security and immutability. The primary function will invoke the Pyth Oracle contract’s get-price function by passing the feed ID and storage address, potentially using as-contract to adjust context appropriately. Error management will rely on try! and unwrap! to handle errors from invalid feeds or outdated data. Deciding between a public or read-only function depends on whether Oracle calls require state changes. For clarity, define-public is likely optimal. The contract must incorporate the pyth-storage-trait for compatibility, while leveraging the pyth-decoder-trait to parse responses. Comprehensive inline documentation will explain each component’s role, including governance checks via pyth-governance-v2 and error propagation logic. Deployment steps will outline compiling the contract with clchi, deploying using Clarinet CLI, and testing with simulated blocks or mock price feeds to validate accuracy under various conditions. Testing with Clarinet helps verify real-time updates and error handling scenarios efficiently.",";; Pyth Oracle integration for BTC/USD price feed
+(use-trait pyth-storage-trait 'SP2JXKMS5S3D5K6Z5X6Y5Q5Q5Y5Q5Y5Q5Y5Q5Y5Q.pyth-traits-v1.storage-trait)
+
+(define-constant PYTH-ORACLE 'SP3Z6MY8HT7D7KJE0D1BZ4YF40S7RMM9Y8G1B9P5G)
+(define-constant PYTH-STORAGE 'SP2JXKMS5S3D5K6Z5X6Y5Q5Q5Y5Q5Y5Q5Y5Q5Y5Q)
+(define-constant BTC-USD-FEED-ID 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43)
+
+(define-read-only (get-btc-price)
+  (match (contract-call? 
+          PYTH-ORACLE 
+          get-price 
+          BTC-USD-FEED-ID 
+          (as-contract PYTH-STORAGE)
+         )
+    price (ok price)
+    err (err err)
+  )
+)
+
+(define-public (update-btc-price (price-feed-bytes (buff 8192)))
+  (begin
+    (contract-call? 
+      PYTH-ORACLE 
+      verify-and-update-price-feeds 
+      price-feed-bytes 
+      {
+        pyth-storage-contract: PYTH-STORAGE,
+        pyth-decoder-contract: 'SP3DX3H4FEYZJZ586MFBS25ZW3HZDMEW92260R2PR,
+        wormhole-core-contract: 'SP3HXJJMJQ06GNAZ8XWDN1QM48JEDC6PP6W3YZPZJ
+      }
+    )
+  )
+)"
+"Develop a basic Clarity smart contract for a token named 'MyToken' (symbol: MTK) with an 8-decimal precision system. Initiate with a total supply of 21,000,000,000 tokens where 200 tokens are assigned to address ST398K1WZTBVY6FE2YEHM6HP20VSNVSSPJTW0D53M and 100 tokens to ST1JDEC841ZDWN9CKXKJMDQGP5TW1AM10B7EV0DV9. Ensure functionality for transferring tokens, allowing others to spend holdings, querying balances, and retrieving the total supply. Include options to cancel spending approvals and embed this metadata URI: ipfs://QmXwNHQ1BmE2hLRykAMMxjsmdeDGFSFg63KDMBUhtcMcKc.","The goal requires a fungible token contract in Clarity for 'MyToken.' First, the contract must define a fungible token with a total supply tracked via a data variable. Allowances between owners and approved addresses need a storage map to manage permissions. Approve and revoke functions will adjust these allowances, ensuring revoke resets permission. The transfer function must validate sender balances, while transfer-from checks both sender allowances and adjusts them post-transfer. Initial token allocation requires a minting function during contract deployment to distribute to specified addresses. Metadata such as name, symbol, decimals, and the provided IPFS URI should be accessible via getter functions. Error handling must enforce valid amounts and sufficient balances. The contract will use private helpers for allowance adjustments and public interfaces for user interaction, ensuring security and clarity. Architecture focuses on data privacy, modular functions, and enforceable constraints for safe token operations."," 
+(define-fungible-token fungible-token)
+
+;; Storage
+(define-map allowances
+  ((spender principal) (owner principal))
+  ((allowance uint)))
+(define-data-var total-supply uint u21000000000)
+
+;; Internals
+
+;; Total number of tokens in existence.
+(define-private (get-total-supply)
+  (var-get total-supply))
+
+;; Gets the amount of tokens that an owner allowed to a spender.
+(define-private (allowance (spender principal) (owner principal))
+  (let ((allowance-val (default-to u0 (map-get? allowances (tuple (spender owner))))))
+    allowance-val
+  )
+)
+
+
+;; Transfers tokens to a specified principal.
+(define-private (transfer (amount uint) (sender principal) (recipient principal) )
+  (match (ft-transfer? fungible-token amount sender recipient)
+    result (ok true)
+    error (err false))
+)
+
+;; Decrease allowance of a specified spender.
+(define-private (decrease-allowance (amount uint) (spender principal) (owner principal))
+  (let ((allowance-val (allowance spender owner)))
+    (if (or (> amount allowance-val) (<= amount u0))
+      true
+      (begin
+        (map-set allowances
+          ((spender spender) (owner owner))
+          ((allowance-val (- allowance-val amount))))
+        true)))
+        )
+        
+;; Internal - Increase allowance of a specified spender.
+(define-private (increase-allowance (amount uint) (spender principal) (owner principal))
+  (let ((allowance-val (allowance spender owner)))
+    (if (<= amount u0)
+      false
+      (begin
+         (map-set allowances
+          ((spender spender) (owner owner))
+          ((allowance-val (+ allowance-val amount))))
+        true))))
+
+;; Public functions
+
+;; Transfers tokens to a specified principal.
+(define-public (transfer-token (amount uint) (recipient principal) )
+  (transfer amount tx-sender recipient)
+)
+
+;; Transfers tokens to a specified principal, performed by a spender
+(define-public (transfer-from (amount uint) (owner principal) (recipient principal) )
+  (let ((allowance (allowance tx-sender owner)))
+    (begin
+      (if (or (> amount allowance-val) (<= amount u0))
+        (err false)
+        (if (and
+            (unwrap! (transfer amount owner recipient) (err false))
+            (decrease-allowance amount tx-sender owner))
+        (ok true)
+        (err false)))))
+)
+
+;; Update the allowance for a given spender
+(define-public (approve (amount uint) (spender principal) )
+  (if (and (> amount u0)
+           (print (increase-allowance amount spender tx-sender )))
+      (ok amount)
+      (err false)))
+
+;; Revoke a given spender
+(define-public (revoke (spender principal))
+  (let ((allowance-val (allowance spender tx-sender)))
+    (if (and (> allowance-val u0)
+             (decrease-allowance allowance-val spender tx-sender))
+        (ok 0)
+        (err false))))
+
+;; Retrieve the human-readable name of the token
+(define-public (get-name)
+  ""MyToken""
+)
+
+;; Retrieve the ticker symbol of the token
+(define-public (get-symbol)
+  ""MTK""
+)
+
+;; Retrieve the number of decimals used
+(define-public (get-decimals)
+  8 ;; Assuming 8 decimals
+)
+
+;; Retrieve the balance of a specific principal
+(define-public (get-balance (owner principal))
+  (ft-get-balance fungible-token owner)
+)
+
+;; Retrieve the current total supply
+(define-public (get-total-supply)
+  (var-get total-supply)
+)
+
+;; Retrieve an example URI that represents metadata of this token
+(define-public (get-token-uri)
+  ""ipfs://QmXwNHQ1BmE2hLRykAMMxjsmdeDGFSFg63KDMBUhtcMcKc""
+)
+
+;; Mint new tokens.
+(define-private (mint (amount uint) (account principal))
+  (if (<= amount u0)
+      (err false)
+      (begin
+        (var-set total-supply (+ (var-get total-supply) amount))
+        (ft-mint? fungible-token amount account)
+        (ok amount))))
+
+;; Initialize the contract
+(begin
+  (mint u200 'ST398K1WZTBVY6FE2YEHM6HP20VSNVSSPJTW0D53M)
+  (mint u100 'ST1JDEC841ZDWN9CKXKJMDQGP5TW1AM10B7EV0DV9))"
+"Develop a Clarity smart contract for a Stacks blockchain multisig wallet that supports owner administration (addition/removal with threshold validation), transaction submission/approval/cancellation, and cross-chain asset transfers via a bridge interface. Incorporate SIP-009/NFT and SIP-010/FT standards for asset handling, enforce permission controls through authorized caller lists, verify transaction approvals against ownership thresholds, and handle errors for conflicts, invalid inputs, and unauthorized operations. Organize the code with descriptive comments, data structures for tracking transactions/owners, and utility functions for state modifications, ensuring all critical functions include sender authentication and parameter integrity checks.","The contract constructs a multi-signature wallet (Multisafe) using Clarity on Stacks. First, it imports required interfaces defining execution rules, safe behavior, and token standards for NFTs/FTs, plus cross-chain bridge capabilities. By implementing the safe-trait interface, the contract establishes its role as a secure wallet. Error codes are defined to address authorization failures, transaction states, and other issues. The contract's principal (SELF) is used to enable self-referential operations. Core state variables include an owner list (capped at 20), approval threshold, and transaction counter. Owner management functions include strict validation to ensure threshold validity. Transactions follow a lifecycle: submission, confirmation, and execution, tracked via a detailed map. Security measures verify callers are contract owners or the contract itself. Cross-chain functionality integrates a bridge for escrow-based swaps. Initialization sets up initial owners and a 2-of-3 approval threshold. The design balances flexibility and security with a structured workflow for multi-party approvals and cross-chain interoperability.",";;title: safe-clar
+
+(use-trait executor-trait .traits.executor-trait) 
+(use-trait safe-trait .traits.safe-trait)
+(use-trait nft-trait .traits.sip-009-trait)
+(use-trait ft-trait .traits.sip-010-trait)
+(use-trait magic-bridge-trait .traits.magic-bridge-trait)
+
+(impl-trait .traits.safe-trait)
+
+(define-constant ERR-CALLER-MUST-BE-SELF (err u100))
+(define-constant ERR-OWNER-ALREADY-EXISTS (err u110))
+(define-constant ERR-OWNER-NOT-EXISTS (err u120))
+(define-constant ERR-UNAUTHORIZED-SENDER (err u130))
+(define-constant ERR-ONLY-END-USER (err u135))
+(define-constant ERR-TX-NOT-FOUND (err u140))
+(define-constant ERR-TX-ALREADY-CONFIRMED-BY-OWNER (err u150))
+(define-constant ERR-TX-INVALID-EXECUTOR (err u160))
+(define-constant ERR-INVALID-SAFE (err u170))
+(define-constant ERR-TX-CONFIRMED (err u180))
+(define-constant ERR-TX-NOT-CONFIRMED-BY-SENDER (err u190))
+(define-constant ERR-THRESHOLD-CANT-BE-ZERO (err u210))
+(define-constant ERR-OWNER-OVERFLOW (err u220))
+(define-constant ERR-THRESHOLD-OVERFLOW (err u230))
+(define-constant ERR-TX-INVALID-FT (err u240))
+(define-constant ERR-TX-INVALID-NFT (err u250))
+(define-constant ERR-MB-ADDRESS-NOT-SET (err u260))
+(define-constant ERR-INVALID-MB-ADDRESS (err u270))
+
+(define-constant SELF (as-contract tx-sender))
+
+
+(define-constant VERSION ""0.0.5.beta"")
+
+(define-read-only (get-version) 
+    VERSION
+)
+
+
+(define-data-var owners (list 20 principal) (list)) 
+
+(define-read-only (get-owners)
+    (var-get owners)
+)
+
+(define-private (add-owner-internal (owner principal))
+    (let 
+        (
+           (new-owners (unwrap! (as-max-len? (append (var-get owners) owner) u20) ERR-OWNER-OVERFLOW))
+        )
+        (ok (var-set owners new-owners))
+    )
+)
+
+(define-public (add-owner (owner principal))
+    (begin
+        (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+        (asserts! (is-none (index-of (var-get owners) owner)) ERR-OWNER-ALREADY-EXISTS)
+        (add-owner-internal owner)
+    )
+)
+
+(define-data-var rem-owner principal tx-sender)
+
+(define-private (remove-owner-filter (owner principal)) (not (is-eq owner (var-get rem-owner))))
+
+(define-public (remove-owner (owner principal))
+    (let
+        (
+            (owners-list (var-get owners))
+        )
+        (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+        (asserts! (is-some (index-of owners-list owner)) ERR-OWNER-NOT-EXISTS)
+        (asserts! (>= (- (len owners-list) u1) (var-get threshold)) ERR-THRESHOLD-OVERFLOW)
+        (var-set rem-owner owner)
+        (ok (var-set owners (unwrap-panic (as-max-len? (filter remove-owner-filter owners-list) u20))))
+    )
+)
+
+
+
+(define-data-var threshold uint u1)
+
+(define-read-only (get-threshold)
+    (var-get threshold)
+)
+
+(define-private (set-threshold-internal (value uint))
+    (var-set threshold value)
+)
+
+(define-public (set-threshold (value uint))
+    (begin
+        (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+        (asserts! (> value u0) ERR-THRESHOLD-CANT-BE-ZERO)
+        (asserts! (<= value (len (var-get owners))) ERR-THRESHOLD-OVERFLOW)
+        (ok (set-threshold-internal value))
+    )
+)
+
+
+(define-data-var nonce uint u0)
+
+(define-read-only (get-nonce)
+ (var-get nonce)
+)
+
+(define-private (increase-nonce)
+    (var-set nonce (+ (var-get nonce) u1))
+)
+
+
+
+(define-map allowed-callers principal bool)
+
+(define-public (allow-caller (caller principal))
+  (begin
+    (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+    (ok (map-set allowed-callers caller true))
+  )
+)
+
+(define-public (revoke-caller (caller principal))
+  (begin
+    (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+    (ok (map-delete allowed-callers caller))
+  )
+)
+
+(define-read-only (is-allowed-caller (caller principal))
+  (or
+    (match (map-get? allowed-callers caller)
+      value true
+      false
+    )
+    (is-eq tx-sender caller)
+  )
+)
+
+
+(define-read-only (get-info)
+    (ok {
+        version: (get-version),
+        owners: (get-owners),
+        threshold: (get-threshold),
+        nonce: (get-nonce),
+        mb-address: (get-mb-address)
+    })
+)
+
+
+
+
+(define-map transactions 
+    uint 
+    {
+        executor: principal,
+        threshold: uint,
+        confirmations: (list 20 principal),
+        confirmed: bool,
+        param-ft: principal,
+        param-nft: principal,
+        param-p: (optional principal),
+        param-u: (optional uint),
+        param-b: (optional (buff 20))
+    }
+)
+
+(define-private (add (executor <executor-trait>) (param-ft <ft-trait>) (param-nft <nft-trait>) (param-p (optional principal)) (param-u (optional uint)) (param-b (optional (buff 20))))
+    (let 
+        (
+            (tx-id (get-nonce))
+        ) 
+        (map-insert transactions tx-id {
+            executor: (contract-of executor),
+            threshold: (var-get threshold), 
+            confirmations: (list), 
+            confirmed: false,
+            param-ft: (contract-of param-ft),
+            param-nft: (contract-of param-nft),
+            param-p: param-p,
+            param-u: param-u,
+            param-b: param-b
+        })
+        (increase-nonce)
+        tx-id
+    )
+)
+
+(define-read-only (get-transaction (tx-id uint))
+    (merge {id: tx-id} (unwrap-panic (map-get? transactions tx-id)))
+)
+
+(define-read-only (get-transactions (tx-ids (list 20 uint)))
+    (map get-transaction tx-ids)
+)
+
+(define-data-var rem-confirmation principal tx-sender)
+
+(define-private (remove-confirmation-filter (owner principal)) (not (is-eq owner (var-get rem-confirmation))))
+
+
+(define-public (revoke (tx-id uint))
+    (let 
+        (
+            (tx (unwrap! (map-get? transactions tx-id) ERR-TX-NOT-FOUND))
+            (confirmations (get confirmations tx))
+        )
+        (asserts! (is-allowed-caller contract-caller) ERR-ONLY-END-USER)
+        (asserts! (is-eq (get confirmed tx) false) ERR-TX-CONFIRMED)
+        (asserts! (is-some (index-of confirmations tx-sender)) ERR-TX-NOT-CONFIRMED-BY-SENDER)
+        (var-set rem-confirmation tx-sender)
+        (let 
+            (
+                (new-confirmations  (unwrap-panic (as-max-len? (filter remove-confirmation-filter confirmations) u20)))
+                (new-tx (merge tx {confirmations: new-confirmations}))
+            )
+            (map-set transactions tx-id new-tx)
+            (print {action: ""multisafe-revoke"", sender: tx-sender, tx-id: tx-id})
+            (ok true)
+        )
+    )
+)
+
+
+(define-public (confirm (tx-id uint) (executor <executor-trait>) (safe <safe-trait>) (param-ft <ft-trait>) (param-nft <nft-trait>))
+    (begin
+        (asserts! (is-allowed-caller contract-caller) ERR-ONLY-END-USER)
+        (asserts! (is-some (index-of (var-get owners) tx-sender)) ERR-UNAUTHORIZED-SENDER)
+        (asserts! (is-eq (contract-of safe) SELF) ERR-INVALID-SAFE) 
+        (let
+            (
+                (tx (unwrap! (map-get? transactions tx-id) ERR-TX-NOT-FOUND))
+                (confirmations (get confirmations tx))
+            )
+
+            (asserts! (is-eq (get confirmed tx) false) ERR-TX-CONFIRMED)
+            (asserts! (is-none (index-of confirmations tx-sender)) ERR-TX-ALREADY-CONFIRMED-BY-OWNER)
+            (asserts! (is-eq (get executor tx) (contract-of executor)) ERR-TX-INVALID-EXECUTOR)
+            (asserts! (is-eq (get param-ft tx) (contract-of param-ft)) ERR-TX-INVALID-FT)
+            (asserts! (is-eq (get param-nft tx) (contract-of param-nft)) ERR-TX-INVALID-NFT)
+            
+            (let 
+                (
+                    (new-confirmations (unwrap-panic (as-max-len? (append confirmations tx-sender) u20)))
+                    (confirmed (>= (len new-confirmations) (get threshold tx)))
+                    (new-tx (merge tx {confirmations: new-confirmations, confirmed: confirmed}))
+                )
+                (map-set transactions tx-id new-tx)
+                (and confirmed (try! (as-contract (contract-call? executor execute safe param-ft param-nft (get param-p tx) (get param-u tx) (get param-b tx)))))
+                (print {action: ""multisafe-confirmation"", sender: tx-sender, tx-id: tx-id, confirmed: confirmed})
+                (ok confirmed)
+            )
+        )
+    )
+)
+
+(define-public (submit (executor <executor-trait>) (safe <safe-trait>) (param-ft <ft-trait>) (param-nft <nft-trait>) (param-p (optional principal)) (param-u (optional uint)) (param-b (optional (buff 20))))
+    (begin
+        (asserts! (is-allowed-caller contract-caller) ERR-ONLY-END-USER)
+        (asserts! (is-some (index-of (var-get owners) tx-sender)) ERR-UNAUTHORIZED-SENDER)
+        (asserts! (is-eq (contract-of safe) SELF) ERR-INVALID-SAFE) 
+        (let
+            ((tx-id (add executor param-ft param-nft param-p param-u param-b)))
+            (print {action: ""multisafe-submit"", sender: tx-sender, tx-id: tx-id, executor: executor, param-ft: param-ft, param-nft: param-nft, param-p: param-p, param-u: param-u, param-b: param-b})
+            (unwrap-panic (confirm tx-id executor safe param-ft param-nft))
+            (ok tx-id)
+        )
+    )
+)
+
+
+(define-data-var mb-address principal SELF)
+
+(define-public (set-mb-address (address principal))
+    (begin
+        (asserts! (is-eq tx-sender SELF) ERR-CALLER-MUST-BE-SELF)
+        (ok (var-set mb-address address))
+    )
+)
+
+(define-read-only (get-mb-address)
+ (var-get mb-address)
+)
+
+(define-public (mb-initialize-swapper (bridge <magic-bridge-trait>))
+    (begin
+        (asserts! (not (is-eq (var-get mb-address) SELF)) ERR-MB-ADDRESS-NOT-SET)
+        (asserts! (is-eq (contract-of bridge) (var-get mb-address)) ERR-INVALID-MB-ADDRESS)
+        (asserts! (is-some (index-of (var-get owners) tx-sender)) ERR-UNAUTHORIZED-SENDER)
+        (try! (as-contract (contract-call? bridge initialize-swapper)))
+        (ok true)
+    )
+)
+
+(define-public (mb-escrow-swap 
+    (bridge <magic-bridge-trait>)
+    (block { header: (buff 80), height: uint })
+    (prev-blocks (list 10 (buff 80)))
+    (tx (buff 1024))
+    (proof { tx-index: uint, hashes: (list 12 (buff 32)), tree-depth: uint })
+    (output-index uint)
+    (sender (buff 33))
+    (recipient (buff 33))
+    (expiration-buff (buff 4))
+    (hash (buff 32))
+    (swapper-buff (buff 4))
+    (supplier-id uint)
+    (min-to-receive uint)
+  )
+    (begin
+        (asserts! (not (is-eq (var-get mb-address) SELF)) ERR-MB-ADDRESS-NOT-SET)
+        (asserts! (is-eq (contract-of bridge) (var-get mb-address)) ERR-INVALID-MB-ADDRESS)
+        (asserts! (is-some (index-of (var-get owners) tx-sender)) ERR-UNAUTHORIZED-SENDER)
+        (try! (as-contract (contract-call? bridge escrow-swap block prev-blocks tx proof output-index sender recipient expiration-buff hash swapper-buff supplier-id min-to-receive)))
+        (ok true)
+    )
+)
+
+(define-private (init (o (list 20 principal)) (m uint))
+    (begin
+        (map add-owner-internal o)
+        (set-threshold-internal m)
+        (print {action: ""multisafe-init""})
+    )
+)
+
+(init (list 
+    'ST1SJ3DTE5DN7X54YDH5D64R3BCB6A2AG2ZQ8YPD5 
+    'ST2CY5V39NHDPWSXMW9QDT3HC3GD6Q6XX4CFRK9AG 
+    'ST2JHG361ZXG51QTKY2NQCVBPPRRE2KZB1HR05NNC
+) u2) "
+"Design a Clarity smart contract for the Stacks blockchain that acts as a price oracle for BTC/USD rates, utilizing the Pyth Network’s pyth-storage-v3 contract. The contract must retrieve both current and historical prices using a specified feed ID, incorporate error handling with distinct codes, and support historical queries via block hashes or at-block parameters. It should interface with the sbtc-token contract to obtain sBTC total supply, normalize price and supply values (adjusted for 10^8 precision), and calculate the total sBTC value in USD. Ensure robust error management for external call failures, invalid inputs, and arithmetic overflows, while organizing the contract with read-only functions, strict type validation, and clear dependencies on external contracts.","The contract’s primary goal is to securely access Pyth Network price data and perform calculations with error resilience. The error-handling mechanism begins by assigning unique codes like `ERR_UNEXPECTED` (e.g., 5000) to systematically address unforeseen issues. To fetch live BTC prices, the `get-btc-price` function uses `contract-call?` to interact with Pyth, returning a wrapped value on success or `none` on failure. Historical price queries involve `get-btc-price-at`, which first retrieves a valid block hash via `get-stacks-block-info?`, then executes the price lookup at that block using `at-block`, maintaining consistent error handling. Integration with the sbtc-token contract occurs through `contract-call?`, safely obtaining sBTC supply. The `get-sbtc-total-usd-value` function combines normalized supply (divided by 10^8) with adjusted price data, multiplying them to compute USD value, while `unwrap!` ensures early termination on failed calls. The contract’s structure emphasizes read-only operations for safety, type-checked parameters to prevent overflow or invalid data, and modular design for maintainability, with all external dependencies explicitly declared.","(define-constant ERR_UNEXPECTED (err u5000))
+
+(define-read-only (get-btc-price)
+  (match
+    (contract-call?
+      'SP3R4F6C1J3JQWWCVZ3S7FRRYPMYG6ZW6RZK31FXY.pyth-storage-v3
+      get-price
+      0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43
+    )
+    res (some (get price res))
+    e none
+  )
+)
+
+(define-read-only (get-btc-price-at (height uint))
+  (let (
+    (hash (unwrap-panic (get-stacks-block-info? id-header-hash height)))
+  )
+    (at-block hash (match
+      (contract-call?
+        'SP3R4F6C1J3JQWWCVZ3S7FRRYPMYG6ZW6RZK31FXY.pyth-storage-v3
+        get-price
+        0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43
+      )
+      res (some (get price res))
+      e none
+    ))
+  )
+)
+
+(define-read-only (get-sbtc-total-supply)
+  (contract-call? 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token get-total-supply)
+)
+
+(define-read-only (get-sbtc-total-usd-value)
+  (let (
+    (sbtc-total-supply (/ (unwrap! (get-sbtc-total-supply) ERR_UNEXPECTED) u100000000))
+    (btc-price (/ (to-uint (unwrap! (get-btc-price) ERR_UNEXPECTED)) u100000000))
+  )
+    (ok (* sbtc-total-supply btc-price))
+  )
+)"
+"Develop a Clarity smart contract to manage a counter with the following features: establish constants for specific error identifiers, maintain state variables for count, contract owner, and operation cost, provide read-only access to the current count and historical count at a given block, and include public methods to adjust the counter (increment, decrement, add) while enforcing rules like non-negative counts, restricting additions beyond one unit, and collecting STX payments according to the cost variable.","First, constants for error codes must be declared to standardize error handling, such as ERR_COUNT_MUST_BE_POSITIVE for invalid decrements and ERR_ADD_MORE_THAN_ONE to block excessive increments. Additionally, ERR_BLOCK_NOT_FOUND addresses failed block history queries. These constants improve code clarity and consistency. Next, state variables are initialized: count (starting at zero), contract-owner (set to the deploying address), and cost (fixed at 10 STX). Public functions like increment require STX transfers via stx-transfer? before updating the count, while decrement includes a check using asserts! to prevent negative values. The add function enforces that the input exceeds one and calculates total fees (n * cost). Read-only functions use var-get for current count and at-block with block header lookups for historical data, returning errors if blocks are missing. All operations return ok upon success to confirm execution, ensuring users receive clear responses. This structure integrates payment validation, state management, and error constraints to fulfill the requirements securely.",";;title: counter
+(define-constant ERR_COUNT_MUST_BE_POSITIVE (err u1001))
+(define-constant ERROR_ADD_MORE_THAN_ONE (err u1002))
+(define-constant ERR_BLOCK_NOT_FOUND (err u1003))
+
+(define-data-var count uint u0)
+(define-data-var contract-owner principal tx-sender)
+(define-data-var cost uint u10)
+
+
+(define-read-only (get-count)
+  (var-get count)
+)
+
+(define-read-only (get-count-at-block (block uint))
+  (ok (at-block
+    (unwrap! (get-stacks-block-info? id-header-hash block) ERR_BLOCK_NOT_FOUND)
+    (var-get count)
+  ))
+)
+
+(define-public (increment)
+  (begin
+    (try! (stx-transfer? (var-get cost) tx-sender (var-get contract-owner)))
+    (ok (var-set count (+ (var-get count) u1)))
+  )
+)
+
+(define-public (decrement)
+  (let ((current-count (var-get count)))
+    (asserts! (> current-count u0) ERR_COUNT_MUST_BE_POSITIVE)
+    (ok (var-set count (- current-count u1)))
+  )
+)
+
+(define-public (add (n uint))
+  (begin
+    (asserts! (> n u1) ERROR_ADD_MORE_THAN_ONE)
+    (try! (stx-transfer? (* n (var-get cost)) tx-sender (var-get contract-owner)))
+    (ok (var-set count (+ (var-get count) n)))
+  )
+)"
+"I require a Clarity-based smart contract that validates Bitcoin transactions by cross-referencing transaction details with a merkle proof and the corresponding block header. The contract must also process witness data for SegWit transactions, implement robust error handling for potential failures, and enforce strict constraints on data lengths throughout its execution.","To begin, I must clarify the contract's requirements: it must verify Bitcoin transactions using Clarity by validating merkle proofs against block headers, support SegWit witness data, and include error handling for anomalies. This requires expertise in Bitcoin's transaction structure and Clarity's limitations. First, define error codes for scenarios like invalid proofs, buffer overflows, or malformed data to enhance code clarity. Next, develop helper functions to parse Bitcoin's variable-length formats, such as varints and byte arrays, ensuring proper handling of endianness conversions. Transaction parsing functions will decode version, inputs, outputs, and locktime, while SegWit-specific logic will process witness commitments. Block header parsing extracts essential fields for merkle root verification. Merkle proof validation involves reconstructing the root from provided hashes and comparing it to the header's root. SegWit validation requires checking the witness commitment in transaction outputs. The contract must enforce data size limits via Clarity's buffer constraints to prevent overflow. Finally, design user-facing functions to encapsulate verification steps, ensuring deterministic execution and error propagation through Clarity's strict operational limits.",";; title: stateless contract to verify bitcoin transaction
+
+(define-constant ERR-OUT-OF-BOUNDS u1)
+(define-constant ERR-TOO-MANY-TXINS u2)
+(define-constant ERR-TOO-MANY-TXOUTS u3)
+(define-constant ERR-VARSLICE-TOO-LONG u4)
+(define-constant ERR-BAD-HEADER u5)
+(define-constant ERR-HEADER-HEIGHT-MISMATCH u6)
+(define-constant ERR-INVALID-MERKLE-PROOF u7)
+(define-constant ERR-PROOF-TOO-SHORT u8)
+(define-constant ERR-TOO-MANY-WITNESSES u9)
+(define-constant ERR-INVALID-COMMITMENT u10)
+(define-constant ERR-WITNESS-TX-NOT-IN-COMMITMENT u11)
+(define-constant ERR-NOT-SEGWIT-TRANSACTION u12)
+(define-constant ERR-LEFTOVER-DATA u13)
+
+
+(define-private (bool-list-of-len (n uint))
+	(unwrap-panic (slice? (list true true true true true true true true) u0 n)))
+
+(define-read-only (read-uint8 (ctx { txbuff: (buff 4096), index: uint}))
+		(let ((data (get txbuff ctx))
+					(base (get index ctx)))
+				(ok {uint8: (buff-to-uint-le (unwrap-panic (as-max-len? (unwrap! (slice? data base (+ base u1)) (err ERR-OUT-OF-BOUNDS)) u1))),
+						 ctx: { txbuff: data, index: (+ u1 base)}})))
+
+(define-read-only (read-uint16 (ctx { txbuff: (buff 4096), index: uint}))
+		(let ((data (get txbuff ctx))
+					(base (get index ctx)))
+				(ok {uint16: (buff-to-uint-le (unwrap-panic (as-max-len? (unwrap! (slice? data base (+ base u2)) (err ERR-OUT-OF-BOUNDS)) u2))),
+						 ctx: { txbuff: data, index: (+ u2 base)}})))
+
+(define-read-only (read-uint32 (ctx { txbuff: (buff 4096), index: uint}))
+		(let ((data (get txbuff ctx))
+					(base (get index ctx)))
+				(ok {uint32: (buff-to-uint-le (unwrap-panic (as-max-len? (unwrap! (slice? data base (+ base u4)) (err ERR-OUT-OF-BOUNDS)) u4))),
+						 ctx: { txbuff: data, index: (+ u4 base)}})))
+
+(define-read-only (read-uint64 (ctx { txbuff: (buff 4096), index: uint}))
+		(let ((data (get txbuff ctx))
+					(base (get index ctx)))
+				(ok {uint64: (buff-to-uint-le (unwrap-panic (as-max-len? (unwrap! (slice? data base (+ base u8)) (err ERR-OUT-OF-BOUNDS)) u8))),
+						 ctx: { txbuff: data, index: (+ u8 base)}})))
+
+(define-read-only (read-varint (ctx { txbuff: (buff 4096), index: uint}))
+		(let ((ptr (get index ctx))
+					(tx (get txbuff ctx))
+					(byte (buff-to-uint-le (unwrap! (element-at tx ptr)
+																	(err ERR-OUT-OF-BOUNDS)))))
+		 (if (<= byte u252)
+				 (ok { varint: byte, ctx: { txbuff: tx, index: (+ u1 ptr)}})
+				 (if (is-eq byte u253)
+						 (let (
+									 (parsed-u16 (try! (read-uint16 { txbuff: tx, index: (+ u1 ptr)}))))
+								 (ok { varint: (get uint16 parsed-u16), ctx: (get ctx parsed-u16)}))
+						 (if (is-eq byte u254)
+								 (let (
+											 (parsed-u32 (try! (read-uint32 { txbuff: tx, index: (+ u1 ptr)}))))
+										 (ok { varint: (get uint32 parsed-u32), ctx: (get ctx parsed-u32)}))
+								 (let (
+											 (parsed-u64 (try! (read-uint64 { txbuff: tx, index: (+ u1 ptr)}))))
+									(ok { varint: (get uint64 parsed-u64), ctx: (get ctx parsed-u64)})))))))
+
+(define-read-only (read-varslice (old-ctx { txbuff: (buff 4096), index: uint}))
+		(let ((parsed (try! (read-varint old-ctx)))
+					(ctx (get ctx parsed))
+					(slice-start (get index ctx))
+					(target-index (+ slice-start (get varint parsed)))
+					(txbuff (get txbuff ctx)))
+		 (ok {varslice: (unwrap! (slice? txbuff slice-start target-index) (err ERR-OUT-OF-BOUNDS)),
+					ctx: { txbuff: txbuff, index: target-index}})))
+
+(define-private (reverse-buff16 (input (buff 16)))
+	(unwrap-panic (slice? (unwrap-panic (to-consensus-buff? (buff-to-uint-le input))) u1 u17)))
+
+(define-read-only (reverse-buff32 (input (buff 32)))
+	(unwrap-panic (as-max-len? (concat
+		(reverse-buff16 (unwrap-panic (as-max-len? (unwrap-panic (slice? input u16 u32)) u16)))
+		(reverse-buff16 (unwrap-panic (as-max-len? (unwrap-panic (slice? input u0 u16)) u16)))) u32)))
+
+(define-read-only (read-hashslice (old-ctx { txbuff: (buff 4096), index: uint}))
+		(let ((slice-start (get index old-ctx))
+					(target-index (+ u32 slice-start))
+					(txbuff (get txbuff old-ctx))
+					(hash-le (unwrap-panic
+											(as-max-len? (unwrap!
+																			(slice? txbuff slice-start target-index) (err ERR-OUT-OF-BOUNDS)) u32))))
+		 (ok {hashslice: (reverse-buff32 hash-le),
+					ctx: { txbuff: txbuff, index: target-index}})))
+
+(define-read-only (read-next-txin (ignored bool)
+																	(result (response {ctx: { txbuff: (buff 4096), index: uint },
+																												remaining: uint,
+																												txins: (list 8 {outpoint: {
+																																									 hash: (buff 32),
+																																									 index: uint},
+																																				sequence: uint})}
+																							uint)))
+		(let ((state (unwrap! result result)))
+							(let ((remaining (get remaining state))
+										(ctx (get ctx state))
+										(parsed-hash (try! (read-hashslice ctx)))
+										(parsed-index (try! (read-uint32 (get ctx parsed-hash))))
+										(parsed-scriptSig (try! (read-varslice (get ctx parsed-index))))
+										(parsed-sequence (try! (read-uint32 (get ctx parsed-scriptSig))))
+										(new-ctx (get ctx parsed-sequence)))
+								(ok {ctx: new-ctx,
+										remaining: (- remaining u1),
+										txins: (unwrap!
+														(as-max-len?
+																(append (get txins state) {   outpoint: {
+																										hash: (get hashslice parsed-hash),
+																										index: (get uint32 parsed-index) },
+																				scriptSig: (unwrap! (as-max-len? (get varslice parsed-scriptSig) u256) (err ERR-VARSLICE-TOO-LONG)),
+																				sequence: (get uint32 parsed-sequence)}) u8)
+														(err ERR-TOO-MANY-TXINS))}))
+							))
+
+(define-read-only (read-txins (ctx { txbuff: (buff 4096), index: uint}))
+		(let ((parsed-num-txins (try! (read-varint ctx)))
+					(num-txins (get varint parsed-num-txins))
+					(new-ctx (get ctx parsed-num-txins)))
+		 (if (> num-txins u8)
+				 (err ERR-TOO-MANY-TXINS)
+				 (fold read-next-txin (bool-list-of-len num-txins) (ok { ctx: new-ctx, remaining: num-txins, txins: (list)})))))
+
+(define-read-only (read-next-txout (ignored bool)
+																	 (result (response {ctx: { txbuff: (buff 4096), index: uint },
+																											txouts: (list 8 {value: uint,
+																																			 scriptPubKey: (buff 128)})}
+																							 uint)))
+		(let ((state (unwrap! result result))
+					(parsed-value (try! (read-uint64 (get ctx state))))
+					(parsed-script (try! (read-varslice (get ctx parsed-value))))
+					(new-ctx (get ctx parsed-script)))
+				(ok {ctx: new-ctx,
+						txouts: (unwrap!
+											(as-max-len?
+													(append (get txouts state)
+															{   value: (get uint64 parsed-value),
+																	scriptPubKey: (unwrap! (as-max-len? (get varslice parsed-script) u128) (err ERR-VARSLICE-TOO-LONG))}) u8)
+											(err ERR-TOO-MANY-TXOUTS))})))
+
+(define-read-only (read-txouts (ctx { txbuff: (buff 4096), index: uint}))
+		(let ((parsed-num-txouts (try! (read-varint ctx)))
+					(num-txouts (get varint parsed-num-txouts))
+					(new-ctx (get ctx parsed-num-txouts)))
+		 (if (> num-txouts u8)
+				 (err ERR-TOO-MANY-TXOUTS)
+				 (fold read-next-txout (bool-list-of-len num-txouts) (ok { ctx: new-ctx, txouts: (list)})))))
+
+(define-read-only (read-next-item (ignored bool)
+																	 (result (response {ctx: { txbuff: (buff 4096), index: uint },
+																												 items: (list 8 (buff 128))}
+																							 uint)))
+		(let ((state (unwrap! result result))
+					(parsed-item (try! (read-varslice (get ctx state))))
+					(new-ctx (get ctx parsed-item)))
+				(ok {ctx: new-ctx,
+						items: (unwrap!
+											(as-max-len?
+													(append (get items state) (unwrap! (as-max-len? (get varslice parsed-item) u128) (err ERR-VARSLICE-TOO-LONG))) u8)
+											(err ERR-TOO-MANY-WITNESSES))})))
+
+(define-read-only (read-next-witness (ignored bool)
+	(result (response
+		{ ctx: {txbuff: (buff 4096), index: uint}, witnesses: (list 8 (list 8 (buff 128))) } uint)))
+	(let ((state (unwrap! result result))
+				(parsed-num-items (try! (read-varint (get ctx state))))
+				(ctx (get ctx parsed-num-items))
+				(varint (get varint parsed-num-items)))
+			(if (> varint u0)
+				(let ((parsed-items (try! (fold read-next-item (bool-list-of-len varint) (ok { ctx: ctx, items: (list)})))))
+						(ok {
+							witnesses: (unwrap-panic (as-max-len? (append (get witnesses state) (get items parsed-items)) u8)),
+							ctx: (get ctx parsed-items)
+						}))
+				(ok {
+					witnesses: (unwrap-panic (as-max-len? (append (get witnesses state) (list)) u8)),
+					ctx: ctx
+				}))))
+
+(define-read-only (read-witnesses (ctx { txbuff: (buff 4096), index: uint }) (num-txins uint))
+	(fold read-next-witness (bool-list-of-len num-txins) (ok { ctx: ctx, witnesses: (list) })))
+
+(define-read-only (parse-wtx (tx (buff 4096)) (calculate-txid bool))
+		(let ((ctx { txbuff: tx, index: u0})
+					(parsed-version (try! (read-uint32 ctx)))
+					(parsed-segwit-marker (try! (read-uint8 (get ctx parsed-version))))
+					(parsed-segwit-version (try! (read-uint8 (get ctx parsed-segwit-marker))))
+					(parsed-txins (try! (read-txins (get ctx parsed-segwit-version))))
+					(parsed-txouts (try! (read-txouts (get ctx parsed-txins))))
+					(parsed-witnesses (try! (read-witnesses (get ctx parsed-txouts) (len (get txins parsed-txins)))))
+					(parsed-locktime (try! (read-uint32 (get ctx parsed-witnesses))))
+					)
+		(asserts! (and (is-eq (get uint8 parsed-segwit-marker) u0) (is-eq (get uint8 parsed-segwit-version) u1)) (err ERR-NOT-SEGWIT-TRANSACTION))
+		(asserts! (is-eq (len tx) (get index (get ctx parsed-locktime))) (err ERR-LEFTOVER-DATA))
+		(ok {version: (get uint32 parsed-version),
+			segwit-marker: (get uint8 parsed-segwit-marker),
+			segwit-version: (get uint8 parsed-segwit-version),
+			ins: (get txins parsed-txins),
+			outs: (get txouts parsed-txouts),
+			txid: (if calculate-txid
+				(some (reverse-buff32 (sha256 (sha256
+					(concat
+						(unwrap-panic (slice? tx u0 u4))
+					(concat
+						(unwrap-panic (slice? tx (get index (get ctx parsed-segwit-version)) (get index (get ctx parsed-txouts))))
+						(unwrap-panic (slice? tx (get index (get ctx parsed-witnesses)) (len tx)))))))))
+				none),
+			witnesses: (get witnesses parsed-witnesses),
+			locktime: (get uint32 parsed-locktime)
+		})))
+
+(define-read-only (parse-tx (tx (buff 4096)))
+		(let ((ctx { txbuff: tx, index: u0})
+			(parsed-version (try! (read-uint32 ctx)))
+			(parsed-txins (try! (read-txins (get ctx parsed-version))))
+			(parsed-txouts (try! (read-txouts (get ctx parsed-txins))))
+			(parsed-locktime (try! (read-uint32 (get ctx parsed-txouts)))))
+		(asserts! (is-eq (len tx) (get index (get ctx parsed-locktime))) (err ERR-LEFTOVER-DATA))
+		(ok {version: (get uint32 parsed-version),
+			ins: (get txins parsed-txins),
+			outs: (get txouts parsed-txouts),
+			locktime: (get uint32 parsed-locktime)})))
+
+(define-read-only (parse-block-header (headerbuff (buff 80)))
+		(let ((ctx { txbuff: headerbuff, index: u0})
+					(parsed-version (try! (read-uint32 ctx)))
+					(parsed-parent-hash (try! (read-hashslice (get ctx parsed-version))))
+					(parsed-merkle-root (try! (read-hashslice (get ctx parsed-parent-hash))))
+					(parsed-timestamp (try! (read-uint32 (get ctx parsed-merkle-root))))
+					(parsed-nbits (try! (read-uint32 (get ctx parsed-timestamp))))
+					(parsed-nonce (try! (read-uint32 (get ctx parsed-nbits)))))
+		 (ok {version: (get uint32 parsed-version),
+					parent: (get hashslice parsed-parent-hash),
+					merkle-root: (get hashslice parsed-merkle-root),
+					timestamp: (get uint32 parsed-timestamp),
+					nbits: (get uint32 parsed-nbits),
+					nonce: (get uint32 parsed-nonce)})))
+
+(define-constant DEBUG-MODE true)
+
+(define-map mock-burnchain-header-hashes uint (buff 32))
+
+(define-public (mock-add-burnchain-block-header-hash (burn-height uint) (hash (buff 32)))
+ (ok (map-set mock-burnchain-header-hashes burn-height hash)))
+
+(define-read-only (get-bc-h-hash (bh uint))
+	 (if DEBUG-MODE (map-get? mock-burnchain-header-hashes bh) (get-burn-block-info? header-hash bh)))
+
+
+(define-read-only (verify-block-header (headerbuff (buff 80)) (expected-block-height uint))
+	(match (get-bc-h-hash expected-block-height)
+			bhh (is-eq bhh (reverse-buff32 (sha256 (sha256 headerbuff))))
+			false))
+
+(define-read-only (get-reversed-txid (tx (buff 4096)))
+		(sha256 (sha256 tx)))
+
+(define-read-only (get-txid (tx (buff 4096)))
+		(reverse-buff32 (sha256 (sha256 tx))))
+
+(define-read-only (is-bit-set (val uint) (bit uint))
+	(> (bit-and val (bit-shift-left u1 bit)) u0))
+
+(define-private (inner-merkle-proof-verify (ctr uint) (state { path: uint, root-hash: (buff 32), proof-hashes: (list 14 (buff 32)), tree-depth: uint, cur-hash: (buff 32), verified: bool}))
+  (let ((path (get path state))
+        (is-left (is-bit-set path ctr))
+        (proof-hashes (get proof-hashes state))
+        (cur-hash (get cur-hash state))
+        (root-hash (get root-hash state))
+
+        (h1 (if is-left (unwrap-panic (element-at proof-hashes ctr)) cur-hash))
+        (h2 (if is-left cur-hash (unwrap-panic (element-at proof-hashes ctr))))
+        (next-hash (sha256 (sha256 (concat h1 h2))))
+        (is-verified (and (is-eq (+ u1 ctr) (len proof-hashes)) (is-eq next-hash root-hash))))
+    (merge state { cur-hash: next-hash, verified: is-verified})))
+
+(define-read-only (verify-merkle-proof (reversed-txid (buff 32)) (merkle-root (buff 32)) (proof { tx-index: uint, hashes: (list 14 (buff 32)), tree-depth: uint}))
+		(if (> (get tree-depth proof) (len (get hashes proof)))
+				(err ERR-PROOF-TOO-SHORT)
+				(ok
+					(get verified
+							(fold inner-merkle-proof-verify
+									(unwrap-panic (slice? (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13) u0 (get tree-depth proof)))
+									{ path: (+ (pow u2 (get tree-depth proof)) (get tx-index proof)), root-hash: merkle-root, proof-hashes: (get hashes proof), cur-hash: reversed-txid, tree-depth: (get tree-depth proof), verified: false})))))
+
+
+(define-read-only (get-commitment-scriptPubKey (outs (list 8 { value: uint, scriptPubKey: (buff 128) })))
+	(fold inner-get-commitment-scriptPubKey outs 0x))
+
+(define-read-only (inner-get-commitment-scriptPubKey (out { value: uint, scriptPubKey: (buff 128) }) (result (buff 128)))
+	(let ((commitment (get scriptPubKey out)))
+		(if (is-commitment-pattern commitment) commitment result)))
+
+(define-read-only (is-commitment-pattern (scriptPubKey (buff 128)))
+	(asserts! (is-eq (unwrap! (slice? scriptPubKey u0 u6) false) 0x6a24aa21a9ed) false))
+
+
+
+(define-read-only (was-tx-mined-compact (height uint) (tx (buff 4096))
+	(header (buff 80))
+	(proof { tx-index: uint, hashes: (list 14 (buff 32)), tree-depth: uint}))
+		(let ((block (unwrap! (parse-block-header header) (err ERR-BAD-HEADER))))
+			(was-tx-mined-internal height tx header (get merkle-root block) proof)))
+
+(define-private (was-tx-mined-internal (height uint) (tx (buff 4096)) (header (buff 80)) (merkle-root (buff 32)) (proof { tx-index: uint, hashes: (list 14 (buff 32)), tree-depth: uint}))
+	(if (verify-block-header header height)
+		(let ((reversed-txid (get-reversed-txid tx))
+					(txid (reverse-buff32 reversed-txid)))
+			(asserts!
+				(or
+					(try! (verify-merkle-proof reversed-txid (reverse-buff32 merkle-root) proof)))
+				(err ERR-INVALID-MERKLE-PROOF))
+			(ok txid))
+		(err ERR-HEADER-HEIGHT-MISMATCH)))
+
+
+(define-read-only (was-segwit-tx-mined-compact
+	(height uint)
+	(wtx (buff 4096))
+	(header (buff 80))
+	(tx-index uint)
+	(tree-depth uint)
+	(wproof (list 14 (buff 32)))
+	(witness-merkle-root (buff 32))
+	(witness-reserved-value (buff 32))
+	(ctx (buff 1024))
+	(cproof (list 14 (buff 32))))
+	(begin
+		(try! (was-tx-mined-compact height ctx header { tx-index: u0, hashes: cproof, tree-depth: tree-depth }))
+		(let (
+			(witness-out (get-commitment-scriptPubKey (get outs (try! (parse-tx ctx)))))
+			(final-hash (sha256 (sha256 (concat witness-merkle-root witness-reserved-value))))
+			(reversed-wtxid (get-reversed-txid wtx))
+			(wtxid (reverse-buff32 reversed-wtxid))
+		)
+			(asserts! (is-eq witness-out (concat 0x6a24aa21a9ed final-hash)) (err ERR-INVALID-COMMITMENT))
+			(asserts! (try! (verify-merkle-proof reversed-wtxid witness-merkle-root
+													{ tx-index: tx-index, hashes: wproof, tree-depth: tree-depth })) (err ERR-WITNESS-TX-NOT-IN-COMMITMENT))
+			(ok wtxid))))"
+"Design a Clarity smart contract for an NFT collection that includes functionality such as defining a non-fungible token, managing token identifiers, handling ownership records, and enabling minting and transferring tokens. The contract should include error codes for scenarios like unauthorized actions or invalid transactions, incorporate a base URI for token metadata, and validate Bitcoin transaction confirmation via an external clarity-bitcoin-lib-v5 library. The minting process must increment the token ID, confirm the sender is the contract owner, verify the Bitcoin transaction was successfully mined, and assign the token to the recipient. The transfer process must restrict initiation to the token owner and update ownership accurately.","First, I'll determine the requirements. The task involves constructing an NFT contract with specific features like ownership, minting, and Bitcoin validation integration. To ensure standard compliance, implementing an NFT interface through a recognized trait in Clarity is necessary. Error handling is crucial for cases such as unauthorized minting attempts or rejected Bitcoin transactions. State variables like the next token ID, ownership records, and a base URI for metadata must be declared. The mint function's logic requires incrementing the token ID, checking sender authority, validating Bitcoin transaction confirmation via the external library, and minting the token. The transfer function needs strict ownership verification before allowing transfers. The Bitcoin tx validation step will rely on the specified library's functionality. Functions should return appropriate success or error statuses, with error constants covering unauthorized access, invalid IDs, or failed tx validations.",";;title: btc-tx-enabled-nft
+(impl-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+
+(define-constant contract-owner tx-sender)
+(define-constant err-owner-only (err u100))
+(define-constant err-not-token-owner (err u101))
+(define-constant err-not-found (err u102))
+(define-constant err-unsupported-tx (err u103))
+(define-constant err-out-not-found (err u104))
+(define-constant err-in-not-found (err u105))
+(define-constant err-tx-not-mined (err u106))
+
+(define-data-var base-uri (string-ascii 80) ""https://your.api.com/path/to/collection/{id}"")
+
+(define-non-fungible-token Your-NFT-Name uint)
+
+(define-data-var last-token-id uint u0)
+
+(define-read-only (get-last-token-id)
+    (ok (var-get last-token-id))
+)
+
+(define-read-only (get-token-uri (token-id uint))
+    (ok (some (var-get base-uri)))
+)
+
+(define-read-only (get-owner (token-id uint))
+    (ok (nft-get-owner? Your-NFT-Name token-id))
+)
+
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+    (begin
+        (asserts! (is-eq tx-sender sender) err-not-token-owner)
+        (nft-transfer? Your-NFT-Name token-id sender recipient)
+    )
+)
+
+(define-public (mint (recipient principal) (height uint) (tx (buff 1024)) (header (buff 80)) (proof { tx-index: uint, hashes: (list 14 (buff 32)), tree-depth: uint}))
+    (let
+        (
+            (token-id (+ (var-get last-token-id) u1))
+            (tx-was-mined (contract-call? 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.clarity-bitcoin-lib-v5 was-tx-mined-compact height tx header proof))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-ok tx-was-mined) err-tx-not-mined)
+        (try! (nft-mint? Your-NFT-Name token-id recipient))
+        (var-set last-token-id token-id)
+        (ok token-id)
+    )
+)"
+"Develop a Clarity smart contract for a fungible token compliant with the SIP-010 standard, ensuring inclusion of all required functions and constants. The contract must implement the SIP-010 trait, establish a token named 'count-token', define error constants for unauthorized owner actions and non-owners, set the contract owner as the transaction deployer, introduce a mutable TOKEN-URI variable initialized with a default value, and declare constants for the token's name, symbol, and decimal places. Include read-only methods to fetch balances, total supply, metadata, and URI, along with public functions to update the URI (owner-only), mint fixed amounts to the sender via a .counter contract, burn tokens or STX if insufficient balance, and transfer tokens between accounts with an optional memo while enforcing ownership validation.","To create this SIP-010-compliant fungible token contract, I first confirm the SIP-010 trait implementation, which aligns with Stacks' fungible token standard. The 'define-fungible-token' directive will establish the 'count-token' type. Error constants like ERR_OWNER_ONLY (u100) and ERR_NOT_TOKEN_OWNER (u101) are designated to handle permission issues. The contract owner is set to tx-sender at deployment. A mutable TOKEN-URI variable, initialized with a placeholder string, allows future updates. Constants for name, symbol, and decimals (e.g., 'Count Token', 'COUNT', and a specified decimal value) define core metadata. Read-only functions are implemented to expose balance, total supply, and metadata. Public functions include set-token-uri (owner-restricted), a mint function restricted to the .counter contract, a burn function with STX fallback, and a transfer function verifying sender authority, managing memos, and adhering to SIP-010 transfer logic. Permission checks ensure only authorized parties can execute critical operations, with URI updates and minting tied to specific conditions.",";;title:count-token
+(impl-trait 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
+
+(define-fungible-token count-token)
+
+(define-constant ERR_OWNER_ONLY (err u100))
+(define-constant ERR_NOT_TOKEN_OWNER (err u101))
+
+(define-constant CONTRACT_OWNER tx-sender)
+(define-data-var TOKEN-URI (optional (string-utf8 256)) (some u""https://ustnpmyvsbtbyjiqiwge.supabase.co/storage/v1/object/public/Count%20Token%20Metadata/count-token-metadata.json""))
+(define-constant TOKEN_NAME ""Count Token"")
+(define-constant TOKEN_SYMBOL ""COUNT"")
+
+
+(define-read-only (get-balance (who principal))
+  (ok (ft-get-balance count-token who))
+)
+
+(define-read-only (get-total-supply)
+  (ok (ft-get-supply count-token))
+)
+
+(define-read-only (get-name)
+  (ok TOKEN_NAME)
+)
+
+(define-read-only (get-symbol)
+  (ok TOKEN_SYMBOL)
+)
+
+(define-read-only (get-decimals)
+  (ok TOKEN_DECIMALS)
+)
+
+(define-read-only (get-token-uri)
+  (ok (var-get TOKEN-URI))
+)
+
+(define-public (set-token-uri (value (string-utf8 256)))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_OWNER_ONLY))
+        (var-set TOKEN-URI (some value))
+        (ok (print {
+              notification: ""token-metadata-update"",
+              payload: {
+                contract-id: (as-contract tx-sender),
+                token-class: ""ft""
+              }
+            })
+        )
+    )
+)
+
+(define-public (mint)
+  (begin
+    (asserts! (is-eq contract-caller .counter) ERR_OWNER_ONLY)
+    (ft-mint? count-token u1000000 tx-sender)
+  )
+)
+
+(define-public (burn)
+  (begin
+    (asserts! (is-eq contract-caller .counter) ERR_OWNER_ONLY)
+    (if (> (unwrap-panic (get-balance tx-sender)) u0)
+      (ft-burn? count-token u1000000 tx-sender)
+      (stx-burn? u1000000 tx-sender)
+    )
+  )
+)
+
+(define-public (transfer
+  (amount uint)
+  (sender principal)
+  (recipient principal)
+  (memo (optional (buff 34)))
+)
+  (begin
+    (asserts! (or (is-eq tx-sender sender) (is-eq contract-caller sender)) ERR_NOT_TOKEN_OWNER)
+    (try! (ft-transfer? count-token amount sender recipient))
+    (match memo to-print (print to-print) 0x)
+    (ok true)
+  )
+)"
+"I require a Clarity smart contract that enables an off-chain payment channel system for STX and SIP-010 tokens, incorporating features such as channel creation, termination, dispute resolution, signature validation, nonce tracking, and payment distribution, while prioritizing security and performance standards in the Stacks blockchain environment.","First, I must analyze how payment channels function within the Stacks ecosystem and their operational flow. These channels enable low-cost, off-chain exchanges between users, reducing on-chain activity and costs. Key steps include establishing a channel with initial deposits, managing multiple transactions via signed updates, and finalizing balances on-chain. The contract must address core operations like channel initialization, state updates, dispute mechanisms, and secure closure. Security is critical, requiring rigorous signature validation to authenticate transactions. For state tracking, the contract needs to store participant details, balance allocations, expiration timers, and nonces to thwart replay attacks. Supporting both native STX and SIP-010 tokens demands a flexible design using traits. Channel identification should use a standardized key derived from participant addresses to ensure uniqueness. Signature protocols aligned with SIP-018 will prevent misuse across different contracts. The lifecycle functions must include cooperative and unilateral closure options, dispute resolution with timelocks, and escrow management for safe fund distribution. Edge cases like inactive participants or invalid state transitions require safeguards like forced timeouts and strict validation checks. Nonce increments, HTLC support for conditional payments, and event logging for monitoring are also essential. The contract must validate balance consistency during updates and implement clear error handling to enhance reliability and user clarity.",";; title: stackflow 
+;; summary: Stackflow is a payment channel network built on Stacks, enabling
+;;   off-chain, non-custodial, and high-speed payments between users. Designed
+;;   to be simple, secure, and efficient, it supports transactions in STX and
+;;   SIP-010 fungible tokens.
+(use-trait sip-010 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)(impl-trait .stackflow-token.stackflow-token)
+(define-constant contract-deployer tx-sender)
+(define-constant MAX_HEIGHT u340282366920938463463374607431768211455)(define-constant structured-data-prefix 0x534950303138)
+(define-constant message-domain-hash (sha256 (unwrap-panic (to-consensus-buff?
+        {
+                name: ""StackFlow"",
+                version: ""0.5.0"",
+                chain-id: chain-id
+        }
+))))
+(define-constant structured-data-header (concat structured-data-prefix message-domain-hash))
+(define-constant ACTION_CLOSE u0)
+(define-constant ACTION_TRANSFER u1)
+(define-constant ACTION_DEPOSIT u2)
+(define-constant ACTION_WITHDRAWAL u3)
+(define-constant ERR_DEPOSIT_FAILED (err u100))
+(define-constant ERR_NO_SUCH_CHANNEL (err u101))
+(define-constant ERR_INVALID_PRINCIPAL (err u102))
+(define-constant ERR_INVALID_SENDER_SIGNATURE (err u103))
+(define-constant ERR_INVALID_OTHER_SIGNATURE (err u104))
+(define-constant ERR_CONSENSUS_BUFF (err u105))
+(define-constant ERR_UNAUTHORIZED (err u106))
+(define-constant ERR_MAX_ALLOWED (err u107))
+(define-constant ERR_INVALID_TOTAL_BALANCE (err u108))
+(define-constant ERR_WITHDRAWAL_FAILED (err u109))
+(define-constant ERR_CHANNEL_EXPIRED (err u110))
+(define-constant ERR_NONCE_TOO_LOW (err u111))
+(define-constant ERR_CLOSE_IN_PROGRESS (err u112))
+(define-constant ERR_NO_CLOSE_IN_PROGRESS (err u113))
+(define-constant ERR_SELF_DISPUTE (err u114))
+(define-constant ERR_ALREADY_FUNDED (err u115))
+(define-constant ERR_INVALID_WITHDRAWAL (err u116))
+(define-constant ERR_UNAPPROVED_TOKEN (err u117))
+(define-constant ERR_NOT_EXPIRED (err u118))
+(define-constant ERR_NOT_INITIALIZED (err u119))
+(define-constant ERR_ALREADY_INITIALIZED (err u120))
+(define-constant ERR_NOT_VALID_YET (err u121))
+(define-data-var initialized bool false)
+(define-data-var supported-token (optional principal) none)
+(define-map
+  channels
+  { token: (optional principal), principal-1: principal, principal-2: principal }
+  { balance-1: uint, balance-2: uint, expires-at: uint, nonce: uint, closer: (optional principal) }
+)
+(define-map agents principal principal)
+;;
+(define-public (init (token (optional <sip-010>)))
+  (begin
+    (asserts! (not (var-get initialized)) ERR_ALREADY_INITIALIZED)
+    (asserts! (is-eq tx-sender contract-deployer) ERR_UNAUTHORIZED)
+    (var-set supported-token (contract-of-optional token))
+    (ok (var-set initialized true))
+  )
+)
+(define-public (register-agent (agent principal))
+  (ok (map-set agents tx-sender agent))
+)
+(define-public (deregister-agent)
+  (ok (map-delete agents tx-sender))
+)
+(define-public (fund-channel (token (optional <sip-010>)) (amount uint) (with principal) (nonce uint))
+  (begin
+    (try! (check-token token))
+
+    (let
+      (
+        (channel-key (try! (get-channel-key (contract-of-optional token) tx-sender with)))
+        (existing-channel (map-get? channels channel-key))
+        (channel
+          (match
+            existing-channel
+            ch
+            ch
+            { balance-1: u0, balance-2: u0, expires-at: MAX_HEIGHT, nonce: nonce, closer: none }
+          )
+        )
+        (updated-channel (try! (increase-sender-balance channel-key channel token amount)))
+        (closer (get closer channel))
+      )
+      (asserts! (>= (get nonce channel) nonce) ERR_NONCE_TOO_LOW)
+      (asserts! (is-none closer) ERR_CLOSE_IN_PROGRESS)
+      (asserts! (not (is-funded tx-sender channel-key channel)) ERR_ALREADY_FUNDED)
+
+      (map-set channels channel-key updated-channel)
+      (print {
+        event: ""fund-channel"",
+        channel-key: channel-key,
+        channel: updated-channel,
+        sender: tx-sender,
+        amount: amount,
+      })
+      (ok channel-key)
+    )
+  )
+)
+(define-public (close-channel
+    (token (optional <sip-010>))
+    (with principal)
+    (my-balance uint)
+    (their-balance uint)
+    (my-signature (buff 65))
+    (their-signature (buff 65))
+    (nonce uint)
+  )
+  (let
+    (
+      (channel-key (try! (get-channel-key (contract-of-optional token) tx-sender with)))
+      (channel (unwrap! (map-get? channels channel-key) ERR_NO_SUCH_CHANNEL))
+      (channel-nonce (get nonce channel))
+      (principal-1 (get principal-1 channel-key))
+      (balance-1 (if (is-eq tx-sender principal-1) my-balance their-balance))
+      (balance-2 (if (is-eq tx-sender principal-1) their-balance my-balance))
+      (updated-channel {
+        balance-1: balance-1,
+        balance-2: balance-2,
+        expires-at: MAX_HEIGHT,
+        nonce: nonce,
+        closer: none
+      })
+    )
+    (asserts! (> nonce channel-nonce) ERR_NONCE_TOO_LOW)
+    (asserts!
+      (is-eq
+        (+ my-balance their-balance)
+        (+ (get balance-1 channel) (get balance-2 channel))
+      )
+      ERR_INVALID_TOTAL_BALANCE
+    )
+    (try!
+      (verify-signatures
+        my-signature
+        tx-sender
+        their-signature
+        with
+        channel-key
+        balance-1
+        balance-2
+        nonce
+        ACTION_CLOSE
+        tx-sender
+        none
+        none
+      )
+    )
+    (reset-channel channel-key nonce)
+    (print {
+      event: ""close-channel"",
+      channel-key: channel-key,
+      channel: updated-channel,
+      sender: tx-sender,
+    })
+    (payout token tx-sender with my-balance their-balance)
+  )
+)
+(define-public (force-cancel (token (optional <sip-010>)) (with principal))
+  (let
+    (
+      (channel-key (try! (get-channel-key (contract-of-optional token) tx-sender with)))
+      (channel (unwrap! (map-get? channels channel-key) ERR_NO_SUCH_CHANNEL))
+      (closer (get closer channel))
+      (expires-at (+ burn-block-height WAITING_PERIOD))
+    )    (asserts! (is-none closer) ERR_CLOSE_IN_PROGRESS)
+    (map-set
+      channels
+      channel-key
+      (merge channel { expires-at: expires-at, closer: (some tx-sender) })
+    )
+    (print {
+      event: ""force-cancel"",
+      channel-key: channel-key,
+      channel: channel,
+      sender: tx-sender,
+    })
+
+    (ok expires-at)
+  )
+)
+(define-public (force-close
+    (token (optional <sip-010>))
+    (with principal)
+    (my-balance uint)
+    (their-balance uint)
+    (my-signature (buff 65))
+    (their-signature (buff 65))
+    (nonce uint)
+    (action uint)
+    (actor principal)
+    (secret (optional (buff 32)))
+    (valid-after (optional uint))
+  )
+  (let
+    (
+      (channel-key (try! (get-channel-key (contract-of-optional token) tx-sender with)))
+      (channel (unwrap! (map-get? channels channel-key) ERR_NO_SUCH_CHANNEL))
+      (channel-nonce (get nonce channel))
+      (closer (get closer channel))
+    )    (asserts! (is-none closer) ERR_CLOSE_IN_PROGRESS)
+    (asserts! (> nonce channel-nonce) ERR_NONCE_TOO_LOW)
+    (match valid-after
+      after (asserts! (<= after burn-block-height) ERR_NOT_VALID_YET)
+      false
+    )
+    (asserts!
+      (is-eq
+        (+ my-balance their-balance)
+        (+ (get balance-1 channel) (get balance-2 channel))
+      )
+      ERR_INVALID_TOTAL_BALANCE
+    )
+
+    (let
+      (
+        (expires-at (+ burn-block-height WAITING_PERIOD))
+        (principal-1 (get principal-1 channel-key))
+        (balance-1 (if (is-eq tx-sender principal-1) my-balance their-balance))
+        (balance-2 (if (is-eq tx-sender principal-1) their-balance my-balance))
+        (new-channel {
+          balance-1: balance-1,
+          balance-2: balance-2,
+          expires-at: expires-at,
+          closer: (some tx-sender),
+          nonce: nonce
+        })
+      )
+      (try!
+        (verify-signatures
+          my-signature
+          tx-sender
+          their-signature
+          with
+          channel-key
+          balance-1
+          balance-2
+          nonce
+          action
+          actor
+          secret
+          valid-after
+        )
+      )
+      (map-set
+        channels
+        channel-key
+        new-channel
+      )
+      (print {
+        event: ""force-close"",
+        channel-key: channel-key,
+        channel: new-channel,
+        sender: tx-sender,
+      })
+
+      (ok expires-at)
+    )
+  )
+)
+(define-public (dispute-closure
+    (token (optional <sip-010>))
+    (with principal)
+    (my-balance uint)
+    (their-balance uint)
+    (my-signature (buff 65))
+    (their-signature (buff 65))
+    (nonce uint)
+    (action uint)
+    (actor principal)
+    (secret (optional (buff 32)))
+    (valid-after (optional uint))
+  )
+  (dispute-closure-inner
+    tx-sender
+    token
+    with
+    my-balance
+    their-balance
+    my-signature
+    their-signature
+    nonce
+    action
+    actor
+    secret
+    valid-after
+  )
+)
+(define-public (agent-dispute-closure
+    (for principal)
+    (token (optional <sip-010>))
+    (with principal)
+    (my-balance uint)
+    (their-balance uint)
+    (my-signature (buff 65))
+    (their-signature (buff 65))
+    (nonce uint)
+    (action uint)
+    (actor principal)
+    (secret (optional (buff 32)))
+    (valid-after (optional uint))
+  )
+  (let
+    (
+      (agent (unwrap! (map-get? agents for) ERR_UNAUTHORIZED))
+    )
+    (asserts! (is-eq tx-sender agent) ERR_UNAUTHORIZED)
+    (dispute-closure-inner
+      for
+      token
+      with
+      my-balance
+      their-balance
+      my-signature
+      their-signature
+      nonce
+      action
+      actor
+      secret
+      valid-after
+    )
+  )
+)
+(define-public (finalize  (token (optional <sip-010>)) (with principal))
+  (let
+    (
+      (channel-key (try! (get-channel-key (contract-of-optional token) tx-sender with)))
+      (channel (unwrap! (map-get? channels channel-key) ERR_NO_SUCH_CHANNEL))
+      (closer (get closer channel))
+      (expires-at (get expires-at channel))
+    )    (asserts! (is-some closer) ERR_NO_CLOSE_IN_PROGRESS)
+    (asserts! (> burn-block-height expires-at) ERR_NOT_EXPIRED)
+    (reset-channel channel-key (get nonce channel))
+    (print {
+      event: ""finalize"",
+      channel-key: channel-key,
+      channel: channel,
+      sender: tx-sender,
+    })
+
+    (payout
+      token
+      (get principal-1 channel-key)
+      (get principal-2 channel-key)
+      (get balance-1 channel)
+      (get balance-2 channel)
+    )
+  )
+)
+(define-public (deposit
+    (amount uint)
+    (token (optional <sip-010>))
+    (with principal)
+    (my-balance uint)
+    (their-balance uint)
+    (my-signature (buff 65))
+    (their-signature (buff 65))
+    (nonce uint)
+  )
+  (let
+    (
+      (channel-key (try! (get-channel-key (contract-of-optional token) tx-sender with)))
+      (channel (unwrap! (map-get? channels channel-key) ERR_NO_SUCH_CHANNEL))
+      (channel-nonce (get nonce channel))
+      (closer (get closer channel))
+      (principal-1 (get principal-1 channel-key))
+      (balance-1 (if (is-eq tx-sender principal-1) my-balance their-balance))
+      (balance-2 (if (is-eq tx-sender principal-1) their-balance my-balance))
+      (updated-channel
+        (merge
+          channel
+          {
+            balance-1: balance-1,
+            balance-2: balance-2,
+            nonce: nonce
+          }
+        )
+      )
+    )    (asserts! (is-none closer) ERR_CLOSE_IN_PROGRESS)
+    (asserts! (> nonce channel-nonce) ERR_NONCE_TOO_LOW)
+    (asserts!
+      (is-eq
+        (+ my-balance their-balance)
+        (+ (get balance-1 channel) (get balance-2 channel) amount)
+      )
+      ERR_INVALID_TOTAL_BALANCE
+    )
+    (try!
+      (verify-signatures
+        my-signature
+        tx-sender
+        their-signature
+        with
+        channel-key
+        balance-1
+        balance-2
+        nonce
+        ACTION_DEPOSIT
+        tx-sender
+        none
+        none
+      )
+    )
+    (try! (increase-sender-balance channel-key channel token amount))
+
+    (map-set
+      channels
+      channel-key
+      updated-channel
+    )
+    (print {
+      event: ""deposit"",
+      channel-key: channel-key,
+      channel: updated-channel,
+      sender: tx-sender,
+      amount: amount,
+      my-signature: my-signature,
+      their-signature: their-signature,
+    })
+    (ok channel-key)
+  )
+)
+(define-public (withdraw
+    (amount uint)
+    (token (optional <sip-010>))
+    (with principal)
+    (my-balance uint)
+    (their-balance uint)
+    (my-signature (buff 65))
+    (their-signature (buff 65))
+    (nonce uint)
+  )
+  (let
+    (
+      (channel-key (try! (get-channel-key (contract-of-optional token) tx-sender with)))
+      (channel (unwrap! (map-get? channels channel-key) ERR_NO_SUCH_CHANNEL))
+      (channel-nonce (get nonce channel))
+      (closer (get closer channel))
+      (principal-1 (get principal-1 channel-key))
+      (balance-1 (if (is-eq tx-sender principal-1) my-balance their-balance))
+      (balance-2 (if (is-eq tx-sender principal-1) their-balance my-balance))
+      (updated-channel
+        (merge
+          channel
+          {
+            balance-1: balance-1,
+            balance-2: balance-2,
+            nonce: nonce
+          }
+        )
+      )
+    )
+    (asserts! (is-none closer) ERR_CLOSE_IN_PROGRESS)
+    (asserts! (> nonce channel-nonce) ERR_NONCE_TOO_LOW)
+    (asserts!
+      (> (+ (get balance-1 channel) (get balance-2 channel)) amount)
+      ERR_INVALID_WITHDRAWAL
+    )
+    (asserts!
+      (is-eq
+        (+ my-balance their-balance)
+        (- (+ (get balance-1 channel) (get balance-2 channel)) amount)
+      )
+      ERR_INVALID_TOTAL_BALANCE
+    )
+    (try!
+      (verify-signatures
+        my-signature
+        tx-sender
+        their-signature
+        with
+        channel-key
+        balance-1
+        balance-2
+        nonce
+        ACTION_WITHDRAWAL
+        tx-sender
+        none
+        none
+      )
+    )
+    (try! (execute-withdraw token amount))
+
+    (map-set
+      channels
+      channel-key
+      updated-channel
+    )
+    (print {
+      event: ""withdraw"",
+      channel-key: channel-key,
+      channel: updated-channel,
+      sender: tx-sender,
+      amount: amount,
+      my-signature: my-signature,
+      their-signature: their-signature,
+    })
+    (ok channel-key)
+  )
+)
+;;
+(define-read-only (get-channel (token (optional principal)) (with principal))
+  (match (get-channel-key token tx-sender with)
+    channel-key (map-get? channels channel-key)
+    e none
+  )
+)
+(define-read-only (make-structured-data-hash
+    (channel-key { token: (optional principal), principal-1: principal, principal-2: principal })
+    (balance-1 uint)
+    (balance-2 uint)
+    (nonce uint)
+    (action uint)
+    (actor principal)
+    (hashed-secret (optional (buff 32)))
+    (valid-after (optional uint))
+  )
+  (let
+    (
+      (structured-data (merge
+        channel-key
+        {
+          balance-1: balance-1,
+          balance-2: balance-2,
+          nonce: nonce,
+          action: action,
+          actor: actor,
+          hashed-secret: hashed-secret,
+          valid-after: valid-after,
+        }
+      ))
+      (data-hash (sha256 (unwrap! (to-consensus-buff? structured-data) ERR_CONSENSUS_BUFF)))
+    )
+    (ok (sha256 (concat structured-data-header data-hash)))
+  )
+)
+(define-read-only (verify-signature
+    (signature (buff 65))
+    (signer principal)
+    (channel-key { token: (optional principal), principal-1: principal, principal-2: principal })
+    (balance-1 uint)
+    (balance-2 uint)
+    (nonce uint)
+    (action uint)
+    (actor principal)
+    (hashed-secret (optional (buff 32)))
+    (valid-after (optional uint))
+  )
+  (let ((hash (unwrap! (make-structured-data-hash
+      channel-key
+      balance-1
+      balance-2
+      nonce
+      action
+      actor
+      hashed-secret
+      valid-after
+    ) false)))
+    (verify-hash-signature hash signature signer actor)
+  )
+)
+(define-read-only (verify-signatures
+    (signature-1 (buff 65))
+    (signer-1 principal)
+    (signature-2 (buff 65))
+    (signer-2 principal)
+    (channel-key { token: (optional principal), principal-1: principal, principal-2: principal })
+    (balance-1 uint)
+    (balance-2 uint)
+    (nonce uint)
+    (action uint)
+    (actor principal)
+    (secret (optional (buff 32)))
+    (valid-after (optional uint))
+  )
+  (let (
+    (hashed-secret (match secret s (some (sha256 s)) none))
+    (hash (try! (make-structured-data-hash
+      channel-key
+      balance-1
+      balance-2
+      nonce
+      action
+      actor
+      hashed-secret
+      valid-after
+    ))))
+    (asserts! (verify-hash-signature hash signature-1 signer-1 actor) ERR_INVALID_SENDER_SIGNATURE)
+    (asserts! (verify-hash-signature hash signature-2 signer-2 actor) ERR_INVALID_OTHER_SIGNATURE)
+    (ok true)
+  )
+)
+;;
+(define-private (contract-of-optional (trait (optional <sip-010>)))
+  (match trait
+    t
+    (some (contract-of t))
+    none
+  )
+)
+(define-private (get-channel-key (token (optional principal)) (principal-1 principal) (principal-2 principal))
+  (let
+    (
+      (p1 (unwrap! (to-consensus-buff? principal-1) ERR_INVALID_PRINCIPAL))
+      (p2 (unwrap! (to-consensus-buff? principal-2) ERR_INVALID_PRINCIPAL))
+    )
+    (ok (if (< p1 p2)
+      { token: token, principal-1: principal-1, principal-2: principal-2 }
+      { token: token, principal-1: principal-2, principal-2: principal-1 }
+    ))
+  )
+)
+(define-private (increase-sender-balance
+    (channel-key { token: (optional principal), principal-1: principal, principal-2: principal })
+    (channel { balance-1: uint, balance-2: uint, expires-at: uint, nonce: uint, closer: (optional principal) })
+    (token (optional <sip-010>))
+    (amount uint)
+  )
+  (begin
+    (match token
+      t
+      (unwrap! (contract-call? t transfer amount tx-sender (as-contract tx-sender) none) ERR_DEPOSIT_FAILED)
+      (unwrap! (stx-transfer? amount tx-sender (as-contract tx-sender)) ERR_DEPOSIT_FAILED)
+    )
+    (ok
+      (if (is-eq tx-sender (get principal-1 channel-key))
+        (merge channel { balance-1: (+ (get balance-1 channel) amount) })
+        (merge channel { balance-2: (+ (get balance-2 channel) amount) })
+      )
+    )
+  )
+)
+(define-private (execute-withdraw
+    (token (optional <sip-010>))
+    (amount uint)
+  )
+  (let ((sender tx-sender))
+    (unwrap!
+      (match token
+        t
+        (as-contract (contract-call? t transfer amount tx-sender sender none))
+        (as-contract (stx-transfer? amount tx-sender sender))
+      )
+      ERR_WITHDRAWAL_FAILED
+    )
+    (ok true)
+  )
+)
+(define-private (dispute-closure-inner
+    (for principal)
+    (token (optional <sip-010>))
+    (with principal)
+    (my-balance uint)
+    (their-balance uint)
+    (my-signature (buff 65))
+    (their-signature (buff 65))
+    (nonce uint)
+    (action uint)
+    (actor principal)
+    (secret (optional (buff 32)))
+    (valid-after (optional uint))
+  )
+  (let
+    (
+      (channel-key (try! (get-channel-key (contract-of-optional token) for with)))
+      (channel (unwrap! (map-get? channels channel-key) ERR_NO_SUCH_CHANNEL))
+      (expires-at (get expires-at channel))
+      (channel-nonce (get nonce channel))
+      (closer (unwrap! (get closer channel) ERR_NO_CLOSE_IN_PROGRESS))
+      (principal-1 (get principal-1 channel-key))
+      (balance-1 (if (is-eq for principal-1) my-balance their-balance))
+      (balance-2 (if (is-eq for principal-1) their-balance my-balance))
+    )
+    (asserts! (not (is-eq for closer)) ERR_SELF_DISPUTE)
+    (asserts! (< burn-block-height expires-at) ERR_CHANNEL_EXPIRED)
+    (asserts! (> nonce channel-nonce) ERR_NONCE_TOO_LOW)
+    (match valid-after
+      after (asserts! (<= after burn-block-height) ERR_NOT_VALID_YET)
+      false
+    )
+    (asserts!
+      (is-eq
+        (+ my-balance their-balance)
+        (+ (get balance-1 channel) (get balance-2 channel))
+      )
+      ERR_INVALID_TOTAL_BALANCE
+    )
+
+    (let
+      (
+        (updated-channel {
+          balance-1: balance-1,
+          balance-2: balance-2,
+          expires-at: MAX_HEIGHT,
+          nonce: nonce,
+          closer: none
+        })
+      )
+      (try!
+        (verify-signatures
+          my-signature
+          for
+          their-signature
+          with
+          channel-key
+          balance-1
+          balance-2
+          nonce
+          action
+          actor
+          secret
+          valid-after
+        )
+      )
+      (reset-channel channel-key nonce)
+      (print {
+        event: ""dispute-closure"",
+        channel-key: channel-key,
+        channel: updated-channel,
+        sender: for,
+      })
+      (payout token for with my-balance their-balance)
+    )
+  )
+)
+(define-private (is-funded
+    (account principal)
+    (channel-key { token: (optional principal), principal-1: principal, principal-2: principal })
+    (channel { balance-1: uint, balance-2: uint, expires-at: uint, nonce: uint, closer: (optional principal) })
+  )
+  (or
+    (and (is-eq account (get principal-1 channel-key)) (> (get balance-1 channel) u0))
+    (and (is-eq account (get principal-2 channel-key)) (> (get balance-2 channel) u0))
+  )
+)
+(define-private (payout
+    (token (optional <sip-010>))
+    (principal-1 principal)
+    (principal-2 principal)
+    (balance-1 uint)
+    (balance-2 uint)
+  )
+  (begin
+    (try! (transfer token principal-1 balance-1))
+    (transfer token principal-2 balance-2)
+  )
+)
+(define-private (transfer (token (optional <sip-010>)) (addr principal) (amount uint))
+  (if (is-eq amount u0)    (ok (is-some token))
+    (begin
+      (match token
+        t (unwrap! (as-contract (contract-call? t transfer amount tx-sender addr none)) ERR_WITHDRAWAL_FAILED)
+        (unwrap! (as-contract (stx-transfer? amount tx-sender addr)) ERR_WITHDRAWAL_FAILED)
+      )
+      (ok (is-some token))
+    )
+  )
+)
+(define-private (reset-channel
+    (channel-key { token: (optional principal), principal-1: principal, principal-2: principal })
+    (nonce uint)
+  )
+  (map-set
+    channels
+    channel-key
+    { balance-1: u0, balance-2: u0, expires-at: MAX_HEIGHT, nonce: nonce, closer: none }
+  )
+)
+(define-private (verify-hash-signature
+    (hash (buff 32))
+    (signature (buff 65))
+    (signer principal)
+    (actor principal)
+  )
+  (or
+    (is-eq (principal-of? (unwrap! (secp256k1-recover? hash signature) false)) (ok signer))    (and
+      (not (is-eq signer actor))
+      (match (map-get? agents signer)
+        agent (is-eq (principal-of? (unwrap! (secp256k1-recover? hash signature) false)) (ok agent))
+        false
+      )
+    )
+  )
+)
+(define-private (check-token (token (optional <sip-010>)))
+  (begin    (asserts! (var-get initialized) ERR_NOT_INITIALIZED)
+    (asserts! (is-eq (contract-of-optional token) (var-get supported-token)) ERR_UNAPPROVED_TOKEN)
+
+    (ok true)
+  )
+)"
+"Develop a Clarity smart contract for a subnet infrastructure that supports miner management, registration of both fungible and non-fungible token contracts, block commitment with withdrawal roots, STX and token deposit/withdrawal processing, Merkle proof validation for verification, and secure asset transfers or minting, following the example structure provided.","To begin, I'll review subnet mechanics in blockchain systems—subnets allow decentralized processing separate from the main network. The contract must enable cross-chain coordination between mainnet and subnet. First, define error identifiers for block submissions, invalid participants, asset validation failures, and transfers to enhance error management. Design state-tracking structures like block records, withdrawal root storage, and withdrawal tracking maps. An authorized miner account will secure block proposal rights.
+Contract interaction with external tokens requires defining standardized interfaces for fungible/non-fungible assets and a minting rule for subnet-originated assets. Miner replacement must be permissioned solely to existing miners. Asset contract registration (via the miner) maps L1-L2 contract relationships.
+Block commits must include fresh withdrawal roots and chronological checks. For assets, STX and tokens require deposit logic (transfers to this contract) and withdrawal fulfillment after Merkle proof verification. NFT withdrawals may require minting if the token isn’t locally held. Fungible token balances need careful management to handle mint/burn logic during withdrawals.
+Merkle validation functions must hash STX/fungible/non-fungible leaf nodes uniquely, then validate proof paths against stored roots. Each withdrawal’s leaf must be claimed exactly once with processing tracking. Implement strict preconditions in all functions to block invalid operations and double-spends. Emit events for traceability during critical operations to enable off-chain tracking.",";;title: subnet
+(define-constant CONTRACT_ADDRESS (as-contract tx-sender))
+(define-constant ERR_BLOCK_ALREADY_COMMITTED 1)
+(define-constant ERR_INVALID_MINER 2)
+(define-constant ERR_CONTRACT_CALL_FAILED 3)
+(define-constant ERR_TRANSFER_FAILED 4)
+(define-constant ERR_DISALLOWED_ASSET 5)
+(define-constant ERR_ASSET_ALREADY_ALLOWED 6)
+(define-constant ERR_MERKLE_ROOT_DOES_NOT_MATCH 7)
+(define-constant ERR_INVALID_MERKLE_ROOT 8)
+(define-constant ERR_WITHDRAWAL_ALREADY_PROCESSED 9)
+(define-constant ERR_VALIDATION_FAILED 10)(define-constant ERR_INVALID_CHAIN_TIP 11)(define-constant ERR_CALLED_TOO_EARLY 12)
+(define-constant ERR_MINT_FAILED 13)
+(define-constant ERR_ATTEMPT_TO_TRANSFER_ZERO_AMOUNT 14)
+(define-constant ERR_IN_COMPUTATION 15)(define-constant ERR_NFT_NOT_OWNED_BY_CONTRACT 16)
+(define-constant ERR_VALIDATION_LEAF_FAILED 30)
+(define-map block-commits uint (buff 32))(define-map withdrawal-roots-map (buff 32) bool)(define-map processed-withdrawal-leaves-map { withdrawal-leaf-hash: (buff 32), withdrawal-root-hash: (buff 32) } bool)
+(define-data-var miner principal 'ST3NBRSFKX28FQ2ZJ1MAKX58HKHSDGNV5N7R21XCP)
+(define-map allowed-contracts principal principal)
+(use-trait nft-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+(use-trait ft-trait 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
+(use-trait mint-from-subnet-trait .subnet-traits.mint-from-subnet-trait)
+(define-public (update-miner (new-miner principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get miner)) (err ERR_INVALID_MINER))
+        (ok (var-set miner new-miner))
+    )
+)
+(define-public (register-new-ft-contract (ft-contract <ft-trait>) (l2-contract principal))
+    (begin        (asserts! (is-miner tx-sender) (err ERR_INVALID_MINER))
+        (asserts! (map-insert allowed-contracts (contract-of ft-contract) l2-contract)
+                  (err ERR_ASSET_ALREADY_ALLOWED))
+
+        (ok true)
+    )
+)
+(define-public (register-new-nft-contract (nft-contract <nft-trait>) (l2-contract principal))
+    (begin        (asserts! (is-miner tx-sender) (err ERR_INVALID_MINER))
+        (asserts! (map-insert allowed-contracts (contract-of nft-contract) l2-contract)
+                  (err ERR_ASSET_ALREADY_ALLOWED))
+
+        (ok true)
+    )
+)
+(define-private (is-miner (miner-to-check principal))
+    (is-eq miner-to-check (var-get miner))
+)
+(define-private (can-commit-block? (commit-block-height uint)  (target-chain-tip (buff 32)))
+    (begin        (asserts! (is-none (map-get? block-commits commit-block-height)) (err ERR_BLOCK_ALREADY_COMMITTED))
+        (asserts! (is-eq
+            target-chain-tip
+            (unwrap! (get-block-info? id-header-hash (- block-height u1)) (err ERR_CALLED_TOO_EARLY)) )
+            (err ERR_INVALID_CHAIN_TIP))
+        (asserts! (is-miner tx-sender) (err ERR_INVALID_MINER))
+        (asserts! (is-miner contract-caller) (err ERR_INVALID_MINER))
+
+        (ok true)
+    )
+)
+(define-private (inner-commit-block (block (buff 32)) (commit-block-height uint) (withdrawal-root (buff 32)))
+    (begin
+        (map-set block-commits commit-block-height block)
+        (map-set withdrawal-roots-map withdrawal-root true)
+        (print {
+            event: ""block-commit"",
+            block-commit: block,
+            withdrawal-root: withdrawal-root,
+            block-height: commit-block-height
+        })
+        (ok block)
+    )
+)
+;;(define-public (commit-block (block (buff 32)) (target-chain-tip (buff 32)) (withdrawal-root (buff 32)))
+    (let ((commit-block-height block-height))
+        (try! (can-commit-block? commit-block-height target-chain-tip))
+        (inner-commit-block block commit-block-height withdrawal-root)
+    )
+)
+
+(define-private (inner-transfer-nft-asset
+        (nft-contract <nft-trait>)
+        (id uint)
+        (sender principal)
+        (recipient principal)
+    )
+    (let (
+            (call-result (contract-call? nft-contract transfer id sender recipient))
+            (transfer-result (unwrap! call-result (err ERR_CONTRACT_CALL_FAILED)))
+        )        (asserts! transfer-result (err ERR_TRANSFER_FAILED))
+
+        (ok true)
+    )
+)
+
+(define-private (inner-mint-nft-asset
+        (nft-mint-contract <mint-from-subnet-trait>)
+        (id uint)
+        (sender principal)
+        (recipient principal)
+    )
+    (let (
+            (call-result (as-contract (contract-call? nft-mint-contract mint-from-subnet id sender recipient)))
+            (mint-result (unwrap! call-result (err ERR_CONTRACT_CALL_FAILED)))
+        )        (asserts! mint-result (err ERR_MINT_FAILED))
+
+        (ok true)
+    )
+)
+
+(define-private (inner-transfer-or-mint-nft-asset
+        (nft-contract <nft-trait>)
+        (nft-mint-contract <mint-from-subnet-trait>)
+        (id uint)
+        (recipient principal)
+    )
+    (let (
+            (call-result (contract-call? nft-contract get-owner id))
+            (nft-owner (unwrap! call-result (err ERR_CONTRACT_CALL_FAILED)))
+            (contract-owns-nft (is-eq nft-owner (some CONTRACT_ADDRESS)))
+            (no-owner (is-eq nft-owner none))
+        )
+
+        (if contract-owns-nft
+            (inner-transfer-nft-asset nft-contract id CONTRACT_ADDRESS recipient)
+            (if no-owner                (inner-mint-nft-asset nft-mint-contract id CONTRACT_ADDRESS recipient)                (err ERR_MINT_FAILED)
+            )
+        )
+    )
+)
+(define-public (deposit-nft-asset
+        (nft-contract <nft-trait>)
+        (id uint)
+        (sender principal)
+    )
+    (let (            (subnet-contract-id (unwrap! (map-get? allowed-contracts (contract-of nft-contract)) (err ERR_DISALLOWED_ASSET)))
+        )
+        (asserts! (try! (inner-transfer-nft-asset nft-contract id sender CONTRACT_ADDRESS)) (err ERR_TRANSFER_FAILED))
+        (print {
+            event: ""deposit-nft"",
+            l1-contract-id: (as-contract nft-contract),
+            nft-id: id,
+            sender: sender,
+            subnet-contract-id: subnet-contract-id,
+        })
+
+        (ok true)
+    )
+)
+
+(define-public (inner-withdraw-nft-asset
+        (nft-contract <nft-trait>)
+        (l2-contract principal)
+        (id uint)
+        (recipient principal)
+        (withdrawal-id uint)
+        (height uint)
+        (nft-mint-contract (optional <mint-from-subnet-trait>))
+        (withdrawal-root (buff 32))
+        (withdrawal-leaf-hash (buff 32))
+        (sibling-hashes (list 50 {
+            hash: (buff 32),
+            is-left-side: bool,
+        }))
+    )
+    (let ((hashes-are-valid (check-withdrawal-hashes withdrawal-root withdrawal-leaf-hash sibling-hashes)))
+
+        (asserts! (try! hashes-are-valid) (err ERR_VALIDATION_FAILED))
+        (asserts! (is-eq withdrawal-leaf-hash
+                         (leaf-hash-withdraw-nft l2-contract id recipient withdrawal-id height))
+                  (err ERR_VALIDATION_LEAF_FAILED))
+
+        (asserts!
+            (try!
+                (match nft-mint-contract
+                    mint-contract (as-contract (inner-transfer-or-mint-nft-asset nft-contract mint-contract id recipient))
+                    (as-contract (inner-transfer-without-mint-nft-asset nft-contract id recipient))
+                )
+            )
+            (err ERR_TRANSFER_FAILED)
+        )
+
+        (asserts!
+            (finish-withdraw { withdrawal-leaf-hash: withdrawal-leaf-hash, withdrawal-root-hash: withdrawal-root })
+            (err ERR_WITHDRAWAL_ALREADY_PROCESSED)
+        )
+
+        (ok true)
+    )
+)
+(define-public (withdraw-nft-asset
+        (nft-contract <nft-trait>)
+        (id uint)
+        (recipient principal)
+        (withdrawal-id uint)
+        (height uint)
+        (nft-mint-contract (optional <mint-from-subnet-trait>))
+        (withdrawal-root (buff 32))
+        (withdrawal-leaf-hash (buff 32))
+        (sibling-hashes (list 50 {
+            hash: (buff 32),
+            is-left-side: bool,
+        }))
+    )
+    (let (            (l2-contract (unwrap! (map-get? allowed-contracts (contract-of nft-contract)) (err ERR_DISALLOWED_ASSET)))
+        )
+        (asserts!
+            (try! (inner-withdraw-nft-asset
+                nft-contract
+                l2-contract
+                id
+                recipient
+                withdrawal-id
+                height
+                nft-mint-contract
+                withdrawal-root
+                withdrawal-leaf-hash
+                sibling-hashes
+            ))
+            (err ERR_TRANSFER_FAILED)
+        )
+        (print {
+            event: ""withdraw-nft"",
+            l1-contract-id: (as-contract nft-contract),
+            nft-id: id,
+            recipient: recipient
+        })
+
+        (ok true)
+    )
+)
+
+(define-private (inner-transfer-without-mint-nft-asset
+        (nft-contract <nft-trait>)
+        (id uint)
+        (recipient principal)
+    )
+    (let (
+            (call-result (contract-call? nft-contract get-owner id))
+            (nft-owner (unwrap! call-result (err ERR_CONTRACT_CALL_FAILED)))
+            (contract-owns-nft (is-eq nft-owner (some CONTRACT_ADDRESS)))
+        )
+
+        (asserts! contract-owns-nft (err ERR_NFT_NOT_OWNED_BY_CONTRACT))
+        (inner-transfer-nft-asset nft-contract id CONTRACT_ADDRESS recipient)
+    )
+)
+
+(define-private (inner-transfer-ft-asset
+        (ft-contract <ft-trait>)
+        (amount uint)
+        (sender principal)
+        (recipient principal)
+        (memo (optional (buff 34)))
+    )
+    (let (
+            (call-result (contract-call? ft-contract transfer amount sender recipient memo))
+            (transfer-result (unwrap! call-result (err ERR_CONTRACT_CALL_FAILED)))
+        )        (asserts! transfer-result (err ERR_TRANSFER_FAILED))
+
+        (ok true)
+    )
+)
+
+(define-private (inner-mint-ft-asset
+        (ft-mint-contract <mint-from-subnet-trait>)
+        (amount uint)
+        (sender principal)
+        (recipient principal)
+    )
+    (let (
+            (call-result (as-contract (contract-call? ft-mint-contract mint-from-subnet amount sender recipient)))
+            (mint-result (unwrap! call-result (err ERR_CONTRACT_CALL_FAILED)))
+        )        (asserts! mint-result (err ERR_MINT_FAILED))
+
+        (ok true)
+    )
+)
+
+(define-private (inner-transfer-or-mint-ft-asset
+        (ft-contract <ft-trait>)
+        (ft-mint-contract <mint-from-subnet-trait>)
+        (amount uint)
+        (recipient principal)
+        (memo (optional (buff 34)))
+    )
+    (let (
+            (call-result (contract-call? ft-contract get-balance CONTRACT_ADDRESS))
+            (contract-ft-balance (unwrap! call-result (err ERR_CONTRACT_CALL_FAILED)))
+            (contract-owns-enough (>= contract-ft-balance amount))
+            (amount-to-transfer (if contract-owns-enough amount contract-ft-balance))
+            (amount-to-mint (- amount amount-to-transfer))
+        )
+        (asserts! (is-eq amount (+ amount-to-transfer amount-to-mint)) (err ERR_IN_COMPUTATION))
+
+        (and
+            (> amount-to-transfer u0)
+            (try! (inner-transfer-ft-asset ft-contract amount-to-transfer CONTRACT_ADDRESS recipient memo))
+        )
+        (and
+            (> amount-to-mint u0)
+            (try! (inner-mint-ft-asset ft-mint-contract amount-to-mint CONTRACT_ADDRESS recipient))
+        )
+
+        (ok true)
+    )
+)
+(define-public (deposit-ft-asset
+        (ft-contract <ft-trait>)
+        (amount uint)
+        (sender principal)
+        (memo (optional (buff 34)))
+    )
+    (let (            (subnet-contract-id (unwrap! (map-get? allowed-contracts (contract-of ft-contract)) (err ERR_DISALLOWED_ASSET)))
+        )        (asserts! (try! (inner-transfer-ft-asset ft-contract amount sender CONTRACT_ADDRESS memo)) (err ERR_TRANSFER_FAILED))
+
+        (let (
+                (ft-name (unwrap! (contract-call? ft-contract get-name) (err ERR_CONTRACT_CALL_FAILED)))
+            )            (print {
+                event: ""deposit-ft"",
+                l1-contract-id: (as-contract ft-contract),
+                ft-name: ft-name,
+                ft-amount: amount,
+                sender: sender,
+                subnet-contract-id: subnet-contract-id,
+            })
+        )
+
+        (ok true)
+    )
+)
+(define-private (inner-withdraw-ft-asset
+        (ft-contract <ft-trait>)
+        (amount uint)
+        (recipient principal)
+        (withdrawal-id uint)
+        (height uint)
+        (memo (optional (buff 34)))
+        (ft-mint-contract (optional <mint-from-subnet-trait>))
+        (withdrawal-root (buff 32))
+        (withdrawal-leaf-hash (buff 32))
+        (sibling-hashes (list 50 {
+            hash: (buff 32),
+            is-left-side: bool,
+        }))
+    )
+    (let ((hashes-are-valid (check-withdrawal-hashes withdrawal-root withdrawal-leaf-hash sibling-hashes)))
+        (asserts! (try! hashes-are-valid) (err ERR_VALIDATION_FAILED))
+        (asserts! (is-eq withdrawal-leaf-hash
+                         (leaf-hash-withdraw-ft (contract-of ft-contract) amount recipient withdrawal-id height))
+                  (err ERR_VALIDATION_LEAF_FAILED))
+
+        (asserts!
+            (try!
+                (match ft-mint-contract
+                    mint-contract (as-contract (inner-transfer-or-mint-ft-asset ft-contract mint-contract amount recipient memo))
+                    (as-contract (inner-transfer-ft-asset ft-contract amount CONTRACT_ADDRESS recipient memo))
+                )
+            )
+            (err ERR_TRANSFER_FAILED)
+        )
+
+        (asserts!
+          (finish-withdraw { withdrawal-leaf-hash: withdrawal-leaf-hash, withdrawal-root-hash: withdrawal-root })
+          (err ERR_WITHDRAWAL_ALREADY_PROCESSED))
+
+        (ok true)
+    )
+)
+(define-public (withdraw-ft-asset
+        (ft-contract <ft-trait>)
+        (amount uint)
+        (recipient principal)
+        (withdrawal-id uint)
+        (height uint)
+        (memo (optional (buff 34)))
+        (ft-mint-contract (optional <mint-from-subnet-trait>))
+        (withdrawal-root (buff 32))
+        (withdrawal-leaf-hash (buff 32))
+        (sibling-hashes (list 50 {
+            hash: (buff 32),
+            is-left-side: bool,
+        }))
+    )
+    (begin        (asserts! (> amount u0) (err ERR_ATTEMPT_TO_TRANSFER_ZERO_AMOUNT))
+        (unwrap! (map-get? allowed-contracts (contract-of ft-contract)) (err ERR_DISALLOWED_ASSET))
+
+        (asserts!
+            (try! (inner-withdraw-ft-asset
+                ft-contract
+                amount
+                recipient
+                withdrawal-id
+                height
+                memo
+                ft-mint-contract
+                withdrawal-root
+                withdrawal-leaf-hash
+                sibling-hashes))
+            (err ERR_TRANSFER_FAILED)
+        )
+
+        (let (
+                (ft-name (unwrap! (contract-call? ft-contract get-name) (err ERR_CONTRACT_CALL_FAILED)))
+            )            (print {
+                event: ""withdraw-ft"",
+                l1-contract-id: (as-contract ft-contract),
+                ft-name: ft-name,
+                ft-amount: amount,
+                recipient: recipient,
+            })
+        )
+
+        (ok true)
+    )
+)
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(define-private (inner-transfer-stx (amount uint) (sender principal) (recipient principal))
+    (let (
+            (call-result (stx-transfer? amount sender recipient))
+            (transfer-result (unwrap! call-result (err ERR_TRANSFER_FAILED)))
+        )        (asserts! transfer-result (err ERR_TRANSFER_FAILED))
+
+        (ok true)
+    )
+)
+(define-public (deposit-stx (amount uint) (sender principal))
+    (begin        (asserts! (try! (inner-transfer-stx amount sender CONTRACT_ADDRESS)) (err ERR_TRANSFER_FAILED))
+        (print { event: ""deposit-stx"", sender: sender, amount: amount })
+
+        (ok true)
+    )
+)
+
+(define-read-only (leaf-hash-withdraw-stx
+        (amount uint)
+        (recipient principal)
+        (withdrawal-id uint)
+        (height uint)
+    )
+    (sha512/256 (concat 0x00 (unwrap-panic (to-consensus-buff?
+        {
+            type: ""stx"",
+            amount: amount,
+            recipient: recipient,
+            withdrawal-id: withdrawal-id,
+            height: height
+        })))
+    )
+)
+
+(define-read-only (leaf-hash-withdraw-nft
+        (asset-contract principal)
+        (nft-id uint)
+        (recipient principal)
+        (withdrawal-id uint)
+        (height uint)
+    )
+    (sha512/256 (concat 0x00 (unwrap-panic (to-consensus-buff?
+        {
+            type: ""nft"",
+            nft-id: nft-id,
+            asset-contract: asset-contract,
+            recipient: recipient,
+            withdrawal-id: withdrawal-id,
+            height: height
+        })))
+    )
+)
+
+(define-read-only (leaf-hash-withdraw-ft
+        (asset-contract principal)
+        (amount uint)
+        (recipient principal)
+        (withdrawal-id uint)
+        (height uint)
+    )
+    (sha512/256 (concat 0x00 (unwrap-panic (to-consensus-buff?
+        {
+            type: ""ft"",
+            amount: amount,
+            asset-contract: asset-contract,
+            recipient: recipient,
+            withdrawal-id: withdrawal-id,
+            height: height
+        })))
+    )
+)
+(define-public (withdraw-stx
+        (amount uint)
+        (recipient principal)
+        (withdrawal-id uint)
+        (height uint)
+        (withdrawal-root (buff 32))
+        (withdrawal-leaf-hash (buff 32))
+        (sibling-hashes (list 50 {
+            hash: (buff 32),
+            is-left-side: bool,
+        }))
+    )
+    (let ((hashes-are-valid (check-withdrawal-hashes withdrawal-root withdrawal-leaf-hash sibling-hashes)))
+
+        (asserts! (try! hashes-are-valid) (err ERR_VALIDATION_FAILED))        (asserts! (is-eq withdrawal-leaf-hash
+                         (leaf-hash-withdraw-stx amount recipient withdrawal-id height))
+                  (err ERR_VALIDATION_LEAF_FAILED))
+
+        (asserts! (try! (as-contract (inner-transfer-stx amount tx-sender recipient))) (err ERR_TRANSFER_FAILED))
+
+        (asserts!
+          (finish-withdraw { withdrawal-leaf-hash: withdrawal-leaf-hash, withdrawal-root-hash: withdrawal-root })
+          (err ERR_WITHDRAWAL_ALREADY_PROCESSED))
+        (print { event: ""withdraw-stx"", recipient: recipient, amount: amount })
+
+        (ok true)
+    )
+)
+
+
+(define-private (create-node-hash
+        (curr-hash (buff 32))
+        (sibling-hash (buff 32))
+        (is-sibling-left-side bool)
+    )
+    (let (
+            (concatted-hash (if is-sibling-left-side
+                    (concat sibling-hash curr-hash)
+                    (concat curr-hash sibling-hash)
+                ))
+          )
+
+          (concat 0x01 concatted-hash)
+    )
+)
+(define-private (hash-help
+        (sibling {
+            hash: (buff 32),
+            is-left-side: bool,
+        })
+        (curr-node-hash (buff 32))
+    )
+    (let (
+            (sibling-hash (get hash sibling))
+            (is-sibling-left-side (get is-left-side sibling))
+            (new-buff (create-node-hash curr-node-hash sibling-hash is-sibling-left-side))
+        )
+       (sha512/256 new-buff)
+    )
+)
+(define-private (check-withdrawal-hashes
+        (withdrawal-root (buff 32))
+        (withdrawal-leaf-hash (buff 32))
+        (sibling-hashes (list 50 {
+            hash: (buff 32),
+            is-left-side: bool,
+        }))
+    )
+    (begin        (asserts! (is-some (map-get? withdrawal-roots-map withdrawal-root)) (err ERR_INVALID_MERKLE_ROOT))
+        (asserts!
+            (is-none
+             (map-get? processed-withdrawal-leaves-map
+                       { withdrawal-leaf-hash: withdrawal-leaf-hash, withdrawal-root-hash: withdrawal-root }))
+            (err ERR_WITHDRAWAL_ALREADY_PROCESSED))
+
+        (let ((calculated-withdrawal-root (fold hash-help sibling-hashes withdrawal-leaf-hash))
+              (roots-match (is-eq calculated-withdrawal-root withdrawal-root)))
+             (if roots-match
+                (ok true)
+                (err ERR_MERKLE_ROOT_DOES_NOT_MATCH))
+        )
+    )
+)
+(define-private (finish-withdraw
+        (withdraw-info {
+            withdrawal-leaf-hash: (buff 32),
+            withdrawal-root-hash: (buff 32)
+        })
+    )
+    (map-insert processed-withdrawal-leaves-map withdraw-info true)
+)"
+"Design a Clarity smart contract for an NFT called 'funny-dog' that adheres to the nft-trait interface, uses a uint type as its unique token identifier, and incorporates minting, ownership transfer, and metadata retrieval functions. The contract must restrict unapproved actions, stop minting exceeding a set maximum, and utilize a base URI for metadata. Include safeguards against unauthorized operations, invalid transfers, and over the collection capacity.","To develop the Funny-Dog NFT contract, begin by adopting the nft-trait interface to ensure compatibility with ecosystem standards. Define the NFT with a 'define-non-fungible-token' command specifying uint identifiers. Track the next available token ID via a counter initialized at zero. Establish ownership by capturing the contract deployer's address as the owner. Declare error codes for unauthorized access, transfer errors, and cap breaches. Store a mutable base URI for metadata. Create read-functions to retrieve token metadata (URI, owner) using built-in lookups. Implement a transfer method verifying sender ownership before execution. Craft a minting function checking ownership, remaining capacity, executing minting, and updating the counter. Enforce the fixed collection size using a constant. Though placeholder token IDs could be dynamically appended to base URIs, the current setup meets core functional requirements. Each step ensures security controls and specification adherence.",";;title: funny dog
+(impl-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+
+(define-non-fungible-token funny-dog uint)
+
+(define-data-var last-token-id uint u0)
+
+(define-constant CONTRACT_OWNER tx-sender)
+
+(define-constant ERR_OWNER_ONLY (err u100))
+(define-constant ERR_NOT_TOKEN_OWNER (err u101))
+(define-constant ERR_SOLD_OUT (err u300))
+
+(define-data-var base-uri (string-ascii 80) ""https://your.api.com/path/to/collection/{id}"")
+
+(define-read-only (get-last-token-id)
+  (ok (var-get last-token-id))
+)
+
+(define-read-only (get-token-uri (token-id uint))
+  (ok (some (var-get base-uri)))
+)
+
+(define-read-only (get-owner (token-id uint))
+  (ok (nft-get-owner? funny-dog token-id))
+)
+
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender sender) ERR_NOT_TOKEN_OWNER)
+    (nft-transfer? funny-dog token-id sender recipient)
+  )
+)
+
+(define-public (mint (recipient principal))
+  (let ((token-id (+ (var-get last-token-id) u1)))
+    (asserts! (< (var-get last-token-id) COLLECTION_LIMIT) ERR_SOLD_OUT)
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (try! (nft-mint? funny-dog token-id recipient))
+
+    (var-set last-token-id token-id)
+    (ok token-id)
+  )
+)"
+"Create a Clarity smart contract for an NFT marketplace enabling users to list, cancel, and purchase NFTs with STX or fungible tokens. Include mechanisms to handle expired listings, unauthorized access, and mismatched assets. Ensure asset contracts are whitelisted, validate listing details rigorously, and implement secure NFT/Fungible Token transfers. Structure the contract for robustness and efficiency without deployment elements.","Initially, identify core marketplace features: listing creation, cancellation, and fulfillment options. Implement STX and Fungible Token payment methods by creating separate transaction pathways. Establish traits for NFT and Fungible Token interactions. Use a structured data map to store listings with seller details, asset references, expiration, price, and payment type. Introduce a whitelist for secured asset contracts and a nonce system to generate unique listing IDs. Develop error handlers for invalid assets, unauthorized actions, and expired listings. Create helper functions for transferring assets and validating transactions. Ensure only authorized parties can modify listings and whitelist configurations. Secure transfers via escrow-like mechanisms to ensure atomic operations. Include checks to authenticate ownership, validate payment accuracy, and confirm payment method alignment with listings. Optimize functions for read-only access to minimize costs.",";;title: nft-marketplace
+(use-trait nft-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+(use-trait ft-trait  'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
+
+(define-constant contract-owner tx-sender)
+
+(define-constant ERR_EXPIRY_IN_PAST (err u1000))
+(define-constant ERR_PRICE_ZERO (err u1001))
+
+(define-constant ERR_UNKNOWN_LISTING (err u2000))
+(define-constant ERR_UNAUTHORISED (err u2001))
+(define-constant ERR_LISTING_EXPIRED (err u2002))
+(define-constant ERR_NFT_ASSET_MISMATCH (err u2003))
+(define-constant ERR_PAYMENT_ASSET_MISMATCH (err u2004))
+(define-constant ERR_MAKER_TAKER_EQUAL (err u2005))
+(define-constant ERR_UNINTENDED_TAKER (err u2006))
+(define-constant ERR_ASSET_CONTRACT_NOT_WHITELISTED (err u2007))
+(define-constant ERR_PAYMENT_CONTRACT_NOT_WHITELISTED (err u2008))
+
+(define-map listings
+  uint
+  {
+    maker: principal,
+    taker: (optional principal),
+    token-id: uint,
+    nft-asset-contract: principal,
+    expiry: uint,
+    price: uint,
+    payment-asset-contract: (optional principal)
+  }
+)
+
+(define-data-var listing-nonce uint u0)
+
+(define-map whitelisted-asset-contracts principal bool)
+
+(define-read-only (is-whitelisted (asset-contract principal))
+  (default-to true (map-get? whitelisted-asset-contracts asset-contract))
+)
+
+(define-public (set-whitelisted (asset-contract principal) (whitelisted bool))
+  (begin
+    (asserts! (is-eq contract-owner tx-sender) ERR_UNAUTHORISED)
+    (ok (map-set whitelisted-asset-contracts asset-contract whitelisted))
+  )
+)
+
+(define-private (transfer-nft
+  (token-contract <nft-trait>)
+  (token-id uint)
+  (sender principal)
+  (recipient principal)
+)
+  (contract-call? token-contract transfer token-id sender recipient)
+)
+
+(define-private (transfer-ft
+  (token-contract <ft-trait>)
+  (amount uint)
+  (sender principal)
+  (recipient principal)
+)
+  (contract-call? token-contract transfer amount sender recipient none)
+)
+
+(define-public (list-asset
+  (nft-asset-contract <nft-trait>)
+  (nft-asset {
+    taker: (optional principal),
+    token-id: uint,
+    expiry: uint,
+    price: uint,
+    payment-asset-contract: (optional principal)
+  })
+)
+  (let ((listing-id (var-get listing-nonce)))
+    (asserts! (is-whitelisted (contract-of nft-asset-contract)) ERR_ASSET_CONTRACT_NOT_WHITELISTED)
+    (asserts! (> (get price nft-asset) u0) ERR_PRICE_ZERO)
+    (asserts! (match (get payment-asset-contract nft-asset)
+      payment-asset
+      (is-whitelisted payment-asset)
+      true
+    ) ERR_PAYMENT_CONTRACT_NOT_WHITELISTED)
+    (try! (transfer-nft
+      nft-asset-contract
+      (get token-id nft-asset)
+      tx-sender
+      (as-contract tx-sender)
+    ))
+    (map-set listings listing-id (merge
+      { maker: tx-sender, nft-asset-contract: (contract-of nft-asset-contract) }
+      nft-asset
+    ))
+    (var-set listing-nonce (+ listing-id u1))
+    (ok listing-id)
+  )
+)
+
+(define-read-only (get-listing (listing-id uint))
+  (map-get? listings listing-id)
+)
+
+(define-public (cancel-listing (listing-id uint) (nft-asset-contract <nft-trait>))
+  (let (
+    (listing (unwrap! (map-get? listings listing-id) ERR_UNKNOWN_LISTING))
+    (maker (get maker listing))
+  )
+    (asserts! (is-eq maker tx-sender) ERR_UNAUTHORISED)
+    (asserts! (is-eq
+      (get nft-asset-contract listing)
+      (contract-of nft-asset-contract)
+    ) ERR_NFT_ASSET_MISMATCH)
+    (map-delete listings listing-id)
+    (as-contract (transfer-nft nft-asset-contract (get token-id listing) tx-sender maker))
+  )
+)
+
+(define-private (assert-can-fulfil
+  (nft-asset-contract principal)
+  (payment-asset-contract (optional principal))
+  (listing {
+    maker: principal,
+    taker: (optional principal),
+    token-id: uint,
+    nft-asset-contract: principal,
+    expiry: uint,
+    price: uint,
+    payment-asset-contract: (optional principal)
+  })
+)
+  (begin
+    (asserts! (not (is-eq (get maker listing) tx-sender)) ERR_MAKER_TAKER_EQUAL)
+    (asserts!
+      (match (get taker listing) intended-taker (is-eq intended-taker tx-sender) true)
+      ERR_UNINTENDED_TAKER
+    )
+    (asserts! (< burn-block-height (get expiry listing)) ERR_LISTING_EXPIRED)
+    (asserts! (is-eq (get nft-asset-contract listing) nft-asset-contract) ERR_NFT_ASSET_MISMATCH)
+    (asserts!
+      (is-eq (get payment-asset-contract listing) payment-asset-contract)
+      ERR_PAYMENT_ASSET_MISMATCH
+    )
+    (ok true)
+  )
+)
+
+(define-public (fulfil-listing-stx (listing-id uint) (nft-asset-contract <nft-trait>))
+  (let (
+    (listing (unwrap! (map-get? listings listing-id) ERR_UNKNOWN_LISTING))
+    (taker tx-sender)
+  )
+    (try! (assert-can-fulfil (contract-of nft-asset-contract) none listing))
+    (try! (as-contract (transfer-nft nft-asset-contract (get token-id listing) tx-sender taker)))
+    (try! (stx-transfer? (get price listing) taker (get maker listing)))
+    (map-delete listings listing-id)
+    (ok listing-id)
+  )
+)
+
+(define-public (fulfil-listing-ft
+  (listing-id uint)
+  (nft-asset-contract <nft-trait>)
+  (payment-asset-contract <ft-trait>)
+)
+  (let (
+    (listing (unwrap! (map-get? listings listing-id) ERR_UNKNOWN_LISTING))
+    (taker tx-sender)
+  )
+    (try! (assert-can-fulfil
+      (contract-of nft-asset-contract)
+      (some (contract-of payment-asset-contract))
+      listing
+    ))
+    (try! (as-contract (transfer-nft nft-asset-contract (get token-id listing) tx-sender taker)))
+    (try! (transfer-ft payment-asset-contract (get price listing) taker (get maker listing)))
+    (map-delete listings listing-id)
+    (ok listing-id)
+  )
+)"
+"Develop a Clarity smart contract for a decentralized marketplace named 'tiny-market' to enable users to create, revoke, and execute NFT trading offers. The contract must handle whitelisting asset contracts, track listing details (seller, buyer, token ID, expiry time, cost), enforce validity rules such as expiry checks, cost accuracy, and payment type restrictions. It must process transactions using STX or fungible tokens (FTs), validate correct permissions for actions like revoking offers, ensure matching asset and payment contracts, utilize traits for NFT and FT compliance, include error handling for issues like access violations or expired offers, and provide utility functions to ensure safe asset transfers.","First, it is essential to establish a smart contract framework that supports NFT trade creation, cancellation, and fulfillment within a decentralized marketplace. The design requires security features for STX/FT transactions, including validation mechanisms and permissions management. Initial steps involve declaring NFT and FT traits via use-trait to interact with standardized protocols, while restricting administrative controls to the contract owner for contract whitelisting decisions. A listings registry is created using a mapping, indexed by unique IDs generated through a nonce counter. Only whitelisted asset and payment contracts are permitted in transactions to mitigate risks. Helper methods for NFT/FT transfers are defined first to handle inter-contract operations safely. Listing submissions are validated by checking contract whitelisting, valid expirations, and non-zero prices before escrowing assets. Cancellation logic requires confirming the user's ownership and returning assets upon success. A separate validation utility centralizes checks for fulfilling offers (e.g., proper buyers, expiry status). Fulfillment pathways for STX-based and FT-based payments divide transaction handling, ensuring funds are transferred only after executing required validations and state updates. Security measures like atomic operations via try! blocks ensure all steps complete fully or roll back entirely, protecting assets from partial transfers. This structure balances functionality with rigorous security constraints to deliver a secure, cross-contract compatible marketplace system.",";; title:tiny-market
+(use-trait nft-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+(use-trait ft-trait 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
+
+(define-constant contract-owner tx-sender)
+
+;; listing errors
+(define-constant err-expiry-in-past (err u1000))
+(define-constant err-price-zero (err u1001))
+
+;; cancelling and fulfiling errors
+(define-constant err-unknown-listing (err u2000))
+(define-constant err-unauthorised (err u2001))
+(define-constant err-listing-expired (err u2002))
+(define-constant err-nft-asset-mismatch (err u2003))
+(define-constant err-payment-asset-mismatch (err u2004))
+(define-constant err-maker-taker-equal (err u2005))
+(define-constant err-unintended-taker (err u2006))
+(define-constant err-asset-contract-not-whitelisted (err u2007))
+(define-constant err-payment-contract-not-whitelisted (err u2008))
+
+(define-map listings
+	uint
+	{
+		maker: principal,
+		taker: (optional principal),
+		token-id: uint,
+		nft-asset-contract: principal,
+		expiry: uint,
+		price: uint,
+		payment-asset-contract: (optional principal)
+	}
+)
+
+(define-data-var listing-nonce uint u0)
+
+(define-map whitelisted-asset-contracts principal bool)
+
+(define-read-only (is-whitelisted (asset-contract principal))
+	(default-to false (map-get? whitelisted-asset-contracts asset-contract))
+)
+
+(define-public (set-whitelisted (asset-contract principal) (whitelisted bool))
+	(begin
+		(asserts! (is-eq contract-owner tx-sender) err-unauthorised)
+		(ok (map-set whitelisted-asset-contracts asset-contract whitelisted))
+	)
+)
+
+(define-private (transfer-nft (token-contract <nft-trait>) (token-id uint) (sender principal) (recipient principal))
+	(contract-call? token-contract transfer token-id sender recipient)
+)
+
+(define-private (transfer-ft (token-contract <ft-trait>) (amount uint) (sender principal) (recipient principal))
+	(contract-call? token-contract transfer amount sender recipient none)
+)
+
+(define-public (list-asset (nft-asset-contract <nft-trait>) (nft-asset {taker: (optional principal), token-id: uint, expiry: uint, price: uint, payment-asset-contract: (optional principal)}))
+	(let ((listing-id (var-get listing-nonce)))
+		(asserts! (is-whitelisted (contract-of nft-asset-contract)) err-asset-contract-not-whitelisted)
+		(asserts! (> (get expiry nft-asset) block-height) err-expiry-in-past)
+		(asserts! (> (get price nft-asset) u0) err-price-zero)
+		(asserts! (match (get payment-asset-contract nft-asset) payment-asset (is-whitelisted payment-asset) true) err-payment-contract-not-whitelisted)
+		(try! (transfer-nft nft-asset-contract (get token-id nft-asset) tx-sender (as-contract tx-sender)))
+		(map-set listings listing-id (merge {maker: tx-sender, nft-asset-contract: (contract-of nft-asset-contract)} nft-asset))
+		(var-set listing-nonce (+ listing-id u1))
+		(ok listing-id)
+	)
+)
+
+(define-read-only (get-listing (listing-id uint))
+	(map-get? listings listing-id)
+)
+
+(define-public (cancel-listing (listing-id uint) (nft-asset-contract <nft-trait>))
+	(let (
+		(listing (unwrap! (map-get? listings listing-id) err-unknown-listing))
+		(maker (get maker listing))
+		)
+		(asserts! (is-eq maker tx-sender) err-unauthorised)
+		(asserts! (is-eq (get nft-asset-contract listing) (contract-of nft-asset-contract)) err-nft-asset-mismatch)
+		(map-delete listings listing-id)
+		(as-contract (transfer-nft nft-asset-contract (get token-id listing) tx-sender maker))
+	)
+)
+
+(define-private (assert-can-fulfil (nft-asset-contract principal) (payment-asset-contract (optional principal)) (listing {maker: principal, taker: (optional principal), token-id: uint, nft-asset-contract: principal, expiry: uint, price: uint, payment-asset-contract: (optional principal)}))
+	(begin
+		(asserts! (not (is-eq (get maker listing) tx-sender)) err-maker-taker-equal)
+		(asserts! (match (get taker listing) intended-taker (is-eq intended-taker tx-sender) true) err-unintended-taker)
+		(asserts! (< block-height (get expiry listing)) err-listing-expired)
+		(asserts! (is-eq (get nft-asset-contract listing) nft-asset-contract) err-nft-asset-mismatch)
+		(asserts! (is-eq (get payment-asset-contract listing) payment-asset-contract) err-payment-asset-mismatch)
+		(ok true)
+	)
+)
+
+(define-public (fulfil-listing-stx (listing-id uint) (nft-asset-contract <nft-trait>))
+	(let (
+		(listing (unwrap! (map-get? listings listing-id) err-unknown-listing))
+		(taker tx-sender)
+		)
+		(try! (assert-can-fulfil (contract-of nft-asset-contract) none listing))
+		(try! (as-contract (transfer-nft nft-asset-contract (get token-id listing) tx-sender taker)))
+		(try! (stx-transfer? (get price listing) taker (get maker listing)))
+		(map-delete listings listing-id)
+		(ok listing-id)
+	)
+)
+
+(define-public (fulfil-listing-ft (listing-id uint) (nft-asset-contract <nft-trait>) (payment-asset-contract <ft-trait>))
+	(let (
+		(listing (unwrap! (map-get? listings listing-id) err-unknown-listing))
+		(taker tx-sender)
+		)
+		(try! (assert-can-fulfil (contract-of nft-asset-contract) (some (contract-of payment-asset-contract)) listing))
+		(try! (as-contract (transfer-nft nft-asset-contract (get token-id listing) tx-sender taker)))
+		(try! (transfer-ft payment-asset-contract (get price listing) taker (get maker listing)))
+		(map-delete listings listing-id)
+		(ok listing-id)
+	)
+)"

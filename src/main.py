@@ -1,26 +1,55 @@
-import pandas as pd
+from openai import OpenAI
 
-# Create a DataFrame with one row and three columns
-text = """Question: Develop a comprehensive Clarity smart contract for the Stacks blockchain that enables a decentralized borrowing system centered on STX tokens, permitting users to submit collateral, secure loans against it, and partake in yield generation. The contract must include mechanisms to manage contributions through personalized account balances, a loan framework with adaptive interest calculations tied to block intervals, and functionality to distribute interest proceeds to participants. Enforce a 50% loan-to-value restriction, a 10% fixed interest rate, and robust error management for situations such as over-borrowing, insufficient collateral, or repayment failures. Implement accessible read-only methods for displaying user-specific balances and total active loan obligations, while adhering to secure STX transfer protocols leveraging standard contract-based transaction guidelines. Deliver thorough explanatory annotations detailing the role and operation of every data structure and function within the contract.  
+client = OpenAI(
+  base_url="https://openrouter.ai/api/v1",
+  api_key="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",
+)
 
-CoT: I will outline a reasoning process for constructing the specified Clarity smart contract.  
+completion = client.chat.completions.create(
+  extra_body={},
+  model="google/gemini-2.0-pro-exp-02-05:free",
+  messages=[
+      {
+        "role": "system",
+        "content": """Paraphrase the following Question and Chain of Thought (CoT) while preserving their meaning.                   
+                      You MUST return ONLY valid JSON in the exact format shown below:
+                      {
+                        "Question": "your rephrased question here",
+                        "CoT": "your rephrased chain of thought here"
+                      }
+                      Do not include explanations, markdown formatting, or any text outside the JSON object."""
+      },
+      {
+        "role": "user",
+        "content": f"Question: Create a detailed Clarity smart contract for the Stacks blockchain that implements a decentralized lending protocol allowing users to deposit STX tokens, borrow against their collateral, and earn yield. The contract should include functionality for managing deposits with user-specific balances, implementing a loan system with dynamic interest calculations based on block height, and distributing yield to depositors. Incorporate a 50% loan-to-value ratio limit, a 10% interest rate, and proper error handling for various scenarios including excessive borrowing and repayment issues. Include comprehensive read-only functions for querying user balances and outstanding loan amounts, and ensure all STX transfers are handled securely using the appropriate contract-based transaction patterns. Provide detailed comments explaining the purpose and functionality of each data structure and function in the contract.\n\nCoT:" + """I'll generate a detailed Chain-of-Thought explaining the reasoning process behind the Clarity smart contract implementation.
 
-First, the task involves designing a decentralized borrowing system focused on STX, with core features including deposit management, interest-bearing loans, and yield distribution. Key datasets—user deposits and loan accounts—warrant structured storage. Maps are chosen to track depositors’ balances (principals to STX amounts) and borrowers’ outstanding loans (principals to [loan amount, last interaction block height]).  
+Let's start by understanding what we need to build: a decentralized lending protocol on the Stacks blockchain with STX tokens as the primary asset. The core functionality requires deposit management, borrowing against collateral, loan processing, and yield distribution.
 
-Persistent variables like total-allocations (aggregating deposited STX) and reserve-pool (collecting accrued interest) support interest distribution. Fixed loan parameters (e.g., 10% annualized rate) and error codes for undercollateralization or repayment discrepancies enhance usability and security.  
+First, the data structure design. The contract needs to track two primary types of data: deposits and loans. For deposits, a map structure is used to associate user principals (blockchain addresses) with their deposit amounts. This approach provides user-specific accounting while maintaining the simplicity needed for a lending protocol. Similarly, loans are tracked with a separate map associating borrowers with both their loan amounts and the block height of their last interaction, which is crucial for interest calculations.
 
-The deposit process uses stx-transfer? to securely transfer funds to the contract, updating both user maps and total-allocations. Borrow operations first verify compliance with 50% collateralization using (/ deposited-amount u2) before issuing new loans. Existing loan interest accumulates via a calculation based on elapsed blocks, ensuring dynamic interest compounding.  
+Next, global state variables are defined. The total-deposits tracks the aggregate deposits in the contract, which is necessary for calculating proportional yields. The pool-reserve holds accumulated interest payments, effectively serving as the yield source for depositors. The loan-interest-rate is set at 10% as specified in the requirements.
 
-Repayment functions compute total due (principal + accrued interest) and isolate interest portions to enrich the reserve-pool, ensuring proper reallocation for yield calculations. Yield claimants receive allocations proportional to their contribution to total-allocations, reinforcing fairness.  
+Error constants are defined to handle various failure scenarios, providing clear feedback to users when operations fail. This follows best practices for smart contract development where error handling is crucial for security and user experience.
 
-Read-only interfaces like user-balance and owed-amount enable transparency, allowing participants to assess their positions without state modifications.  
+Moving to the functional implementation, the deposit function allows users to add STX to the contract. It uses stx-transfer? to move tokens from the user to the contract, updates the user's balance in the deposits map, and increases the total-deposits counter. The function uses a combination of let bindings and map operations to manage state transitions safely.
 
-A critical review identifies a potential omission in the borrowing logic: the existing implementation may neglect to aggregate new loan requests with existing liabilities before enforcing the LTV cap. This oversight could permit users to exceed collateral limits inadvertently.  
+The borrow function implements the 50% loan-to-value ratio requirement. It calculates the allowed borrowing limit based on half the user's deposit (/ user-deposit u2), ensuring users can't borrow more than 50% of their collateral value. Before issuing new loans, it calculates any accrued interest on existing loans using the calculate-accrued-interest private function. The function then updates the loan record with the new total and the current block height for future interest calculations.
 
-Ultimately, the design aligns with the requirements: STX-based deposits, adaptive interest via block intervals, proportional yield rewards, and intentional contract security. Error cases—such as failed transfers or over-pledged loans—are addressed with predefined codes, and the protocol employs established STX transaction methods to minimize vulnerabilities."""
-# Display the DataFrame
+For repayments, the repay function first calculates the total amount due including accrued interest. It then ensures users don't overpay, transfers the repayment amount to the contract, and updates the loan record. Importantly, it adds the interest portion to the pool-reserve, making it available for yield distribution.
 
-for_test = text.split('CoT: ')
+The claim-yield function distributes accumulated interest to depositors proportionally based on their share of the total deposits. This implements the yield earning requirement in the original specification. The calculation (/ (* (var-get pool-reserve) user-deposit) (var-get total-deposits)) determines each user's fair share of the yield.
 
-print('Question: ',for_test[0].replace('Question: ', ''))
-print('CoT: ',for_test[1])
+The read-only functions get-balance-by-sender, get-balance, and get-amount-owed provide transparency, allowing users to query their current positions and obligations without modifying the contract state. This supports the requirement for comprehensive query functions.
+
+Finally, the calculate-accrued-interest private function implements the dynamic interest calculation based on block height as required. It determines the elapsed time in blocks since the last loan interaction and calculates interest proportionally. The calculation (/ (* principal (var-get loan-interest-rate) elapsed-blocks) u10000) applies the 10% interest rate over the elapsed blocks.
+
+Wait, there seems to be an error in the borrow function. The new-loan calculation is incomplete - it only adds the amount without including the existing loan or accrued interest. This might lead to incorrect loan accounting.
+
+Overall, the implementation adheres to the required functionality: deposits with user-specific balances, a loan system with dynamic interest calculations, yield distribution, a 50% loan-to-value ratio, a 10% interest rate, and comprehensive error handling. The contract includes both the required functionality and the necessary read-only functions for querying balances and loan amounts.",";; Define the contract's data variables
+"""
+      }
+    ]
+)
+text = completion.choices[0].message.content.replace('```json', '').replace('```', '')
+text = text + "}" if text.endswith('"') else text
+print(text)
