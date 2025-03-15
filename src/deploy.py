@@ -3,17 +3,31 @@ from sagemaker.huggingface import HuggingFaceModel
 import boto3
 import json
 import time
+from dotenv import load_dotenv
+import os
 
-# Configuration - MODIFY THESE VALUES
+# import environment varialbes
+load_dotenv()
+
+AWS_ACESS_KEY_ID = os.getenv('AWS_ACESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+ROLE_ARN = os.getenv('ROLE_ARN')
+
+# Configuration
 AWS_REGION = 'us-east-1'  # Your AWS region
-ROLE_ARN = 'arn:aws:iam::XXXXXXXXXXXX:role/SageMakerHuggingFaceExecutionRole'  # Your role ARN
-MODEL_ID = 'OriolPalacios/DeepSeek-R1-Clarity-AI-Agent'  # HF model to deploy
-ENDPOINT_NAME = 'hf-llm-endpoint'  # Unique endpoint name
+ROLE_ARN = ROLE_ARN  # Your role ARN
+MODEL_ID = 'OriolPalacios/DeepSeek-R1-Clarity-AI-Agent'  # Your model with LoRA adapter
+BASE_MODEL_ID = 'unsloth/DeepSeek-R1-Distill-Llama-8B'  # Base model your adapter was trained on
+ENDPOINT_NAME = 'deepseek-r1-clarity-ai-agent-llm-endpoint'
 INSTANCE_TYPE = 'ml.g5.xlarge'  # Instance type
 HF_TOKEN = None  # Your HF token if using gated models
 
 # Initialize SageMaker session
-boto_session = boto3.Session(region_name=AWS_REGION)
+boto_session = boto3.Session(
+    aws_access_key_id=AWS_ACESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=AWS_REGION
+)
 sagemaker_session = sagemaker.Session(boto_session=boto_session)
 
 # Configure the Hugging Face model
