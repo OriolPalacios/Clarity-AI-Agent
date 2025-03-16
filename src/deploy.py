@@ -16,8 +16,7 @@ ROLE_ARN = os.getenv('ROLE_ARN')
 # Configuration
 AWS_REGION = 'us-east-1'  # Your AWS region
 ROLE_ARN = ROLE_ARN  # Your role ARN
-MODEL_ID = 'OriolPalacios/DeepSeek-R1-Clarity-AI-Agent'  # Your model with LoRA adapter
-BASE_MODEL_ID = 'unsloth/DeepSeek-R1-Distill-Llama-8B'  # Base model your adapter was trained on
+MODEL_ID = 'OriolPalacios/DeepSeek-R1-Clarity-AI-Agent-2'  # Your model with LoRA adapter
 ENDPOINT_NAME = 'deepseek-r1-clarity-ai-agent-llm-endpoint'
 INSTANCE_TYPE = 'ml.g5.xlarge'  # Instance type
 HF_TOKEN = None  # Your HF token if using gated models
