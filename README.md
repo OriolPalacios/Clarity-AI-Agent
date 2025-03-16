@@ -44,7 +44,7 @@ The following tools and libraries are used in this project:
 ## Pretrained Model
 
 The fine-tuned model is available on Hugging Face:
-[![Hugging Face](https://img.shields.io/badge/🤗_Hugging_Face-DeepSeek--R1--Clarity--AI--Agent-blue)](https://huggingface.co/OriolPalacios/DeepSeek-R1-Clarity-AI-Agent/tree/main)
+[![Hugging Face](https://img.shields.io/badge/🤗_Hugging_Face-DeepSeek--R1--Clarity--AI--Agent-blue)](https://huggingface.co/OriolPalacios/DeepSeek-R1-Clarity-AI-Agent-2/tree/main)
 
 You can access and download all model files from the repository above to use the fine-tuned DeepSeek-R1 model for Clarity smart contract development.
 
