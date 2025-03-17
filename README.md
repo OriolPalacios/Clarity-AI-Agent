@@ -8,6 +8,10 @@
 
 Clarity-AI-Agent is a project aimed at enhancing the development of decentralized applications (dApps) by fine-tuning AI models to assist developers in writing smart contracts using the Clarity language. The project focuses on data augmentation techniques to enrich a dataset containing questions, chain-of-thought (CoT) processes, and code responses, which are then utilized to fine-tune the deepseek r1 model using Low-Rank Adaptation (LoRA).
 
+### Clarity AI Extension
+
+[Clarity IA Agent Extension](https://github.com/joelvegas20/clarity-ia-agent-extension)
+
 ## Installation
 
 [![Python 3.13.1](https://img.shields.io/badge/python-3.13.1-blue.svg)](https://www.python.org/downloads/release/python-3131/)
