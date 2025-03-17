@@ -1,26 +1,12 @@
 # Clarity-AI-Agent
 
+## Demo Video
+
+[![YouTube Demo](https://img.shields.io/badge/Youtube-Demo-red)](https://www.youtube.com/watch?v=Zjf2j64ZgrA)
+
 ## Overview
 
 Clarity-AI-Agent is a project aimed at enhancing the development of decentralized applications (dApps) by fine-tuning AI models to assist developers in writing smart contracts using the Clarity language. The project focuses on data augmentation techniques to enrich a dataset containing questions, chain-of-thought (CoT) processes, and code responses, which are then utilized to fine-tune the deepseek r1 model using Low-Rank Adaptation (LoRA).
-
-## Purpose
-
-This repository is designed to perform data augmentation on a dataset comprised of:
-- Questions
-- Chain of Thought (CoT)
-- Responses (code)
-
-The augmented dataset will be used to apply Low-Rank Adaptation (LoRA) fine-tuning on the deepseek r1 model. The ultimate goal is to build an AI agent that assists developers in building decentralized applications (dapps) using Clarity for smart contracts.
-
-## Tools
-
-The following tools and libraries are used in this project:
-- **Pandas**: For dataset manipulation and processing
-- **OpenAI API**: For generating additional training data
-- **PyTorch**: For model training and fine-tuning
-- **Hugging Face Transformers**: For working with the deepseek r1 model
-- **PEFT**: For efficient LoRA fine-tuning techniques
 
 ## Installation
 
@@ -40,6 +26,19 @@ The following tools and libraries are used in this project:
     ```bash
     pip install -r requirements.txt
     ```
+
+## Data Augmentation
+
+We rely on gemini 2.0 flash, gemini 2.0 pro, and qwen qwq to paraphrase questions and chain-of-thought (CoT) segments using openrouter. We exclude code responses from this process to prevent hallucinations, ensuring the integrity of the generated content.
+
+The following tools and libraries are used in this project:
+- **Pandas**: For dataset manipulation and processing
+- **OpenAI API**: For generating additional training data
+- **PyTorch**: For model training and fine-tuning
+- **Hugging Face Transformers**: For working with the deepseek r1 model
+- **PEFT**: For efficient LoRA fine-tuning techniques
+
+
 
 ## Pretrained Model
 
