@@ -10,7 +10,7 @@ Clarity-AI-Agent is a project aimed at enhancing the development of decentralize
 
 ### Clarity AI Extension
 
-[Clarity IA Agent Extension](https://github.com/joelvegas20/clarity-ia-agent-extension)
+[Clarity AI Agent Extension](https://github.com/joelvegas20/clarity-ia-agent-extension)
 
 ## Installation
 
